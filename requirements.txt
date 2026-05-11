@@ -1,0 +1,33 @@
+# Databas
+psycopg2-binary>=2.9
+pgvector>=0.2
+sqlalchemy>=2.0
+
+# PDF-extraktion
+ocrmypdf>=16.0
+pymupdf>=1.24
+pymupdf4llm>=0.0.17
+
+# Embeddings
+sentence-transformers>=3.0
+torch>=2.0
+
+# Språkdetektering (för flerspråkiga PDF:er)
+lingua-language-detector>=2.0
+
+# MCP-server
+mcp>=1.0
+
+# HTTP-transport
+starlette>=0.36
+uvicorn>=0.27
+
+# Konfiguration
+python-dotenv>=1.0
+
+# Requests
+requests>=2.31
+
+# HTML-parsning (besluts-API)
+beautifulsoup4>=4.12
+lxml>=5.0
