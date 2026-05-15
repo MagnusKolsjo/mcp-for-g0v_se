@@ -326,22 +326,6 @@ def kor(tvinga: bool = False):
     log.info(f"=== Synk klar — {nya_pdf} nya PDF:er, {nya_beslut} nya beslut ===")
 
 
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Daglig synkronisering av gov-data")
-    parser.add_argument("--tvinga", action="store_true",
-                        help="Hämta om listorna oavsett timestamp")
-    parser.add_argument("--installera-schema", action="store_true",
-                        help="Installera schemalagt jobb via cron eller launchd (se .env)")
-    args = parser.parse_args()
-
-    if args.installera_schema:
-        python_sokvag = os.getenv("PYTHON_SOKVÄG", "python3")
-        installera_schema(__file__, python_sokvag)
-    else:
-        kor(tvinga=args.tvinga)
-
-
 def installera_schema(script_sokvag: str, python_sokvag: str):
     """Installerar schemalagt jobb baserat på SCHEMALAGGARE i .env.
 
@@ -417,3 +401,19 @@ def installera_schema(script_sokvag: str, python_sokvag: str):
             log.info(f"Cron-jobb tillagt: {rad.strip()}")
         else:
             log.error("Kunde inte uppdatera crontab.")
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Daglig synkronisering av gov-data")
+    parser.add_argument("--tvinga", action="store_true",
+                        help="Hämta om listorna oavsett timestamp")
+    parser.add_argument("--installera-schema", action="store_true",
+                        help="Installera schemalagt jobb via cron eller launchd (se .env)")
+    args = parser.parse_args()
+
+    if args.installera_schema:
+        python_sokvag = os.getenv("PYTHON_SOKVÄG", "python3")
+        installera_schema(__file__, python_sokvag)
+    else:
+        kor(tvinga=args.tvinga)

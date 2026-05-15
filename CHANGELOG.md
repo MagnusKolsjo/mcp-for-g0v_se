@@ -4,6 +4,17 @@ Alla viktiga ändringar i detta projekt dokumenteras här.
 Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 
+## [2.2.1] — 2026-05-15
+
+### Fixat
+- **`--installera-schema` kraschade med NameError:** `installera_schema()`
+  var definierad *efter* `if __name__ == "__main__":`-blocket — Python
+  exekverar modulnivåkod uppifrån och ned, så funktionen fanns inte när den
+  anropades. Åtgärd: funktionsdefinitionen flyttad till före `if __name__`-blocket.
+- **launchd-jobb saknades:** Ovanstående bugg innebar att `--installera-schema`
+  aldrig körts framgångsrikt. Jobbet installerat manuellt efter fix
+  (`se.riksdag-ai.gov-dokument-synk.plist`, kör dagligen kl 06:45).
+
 ## [2.2.0] — 2026-05-11
 
 ### Fixat
