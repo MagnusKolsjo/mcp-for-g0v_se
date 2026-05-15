@@ -321,6 +321,10 @@ def kor(tvinga: bool = False):
     # 3. Regeringsbeslut
     nya_beslut = synka_beslut(conn, use_postgres)
 
+    # 4. Städa PDF-cache — radera filer vars fulltext finns i databasen
+    from pdf_lib import stada_pdf_cache
+    stada_pdf_cache(conn, use_postgres)
+
     conn.close()
     db.spara_synkstatus("senaste_synk", datetime.utcnow().isoformat())
     log.info(f"=== Synk klar — {nya_pdf} nya PDF:er, {nya_beslut} nya beslut ===")

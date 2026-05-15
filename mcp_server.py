@@ -928,6 +928,12 @@ def gov_hamta_remissvar(
             """, (text, str(sokvag), rv_id))
         conn.commit()
 
+        # Radera lokal PDF — fulltexten finns nu i databasen
+        try:
+            sokvag.unlink(missing_ok=True)
+        except Exception as e:
+            log.warning(f"Kunde inte radera remissvar-PDF {sokvag.name}: {e}")
+
         # Chunka och embedda (endast PostgreSQL)
         if use_pg and rv_id:
             chunks = _chunka_text(text)
@@ -1248,6 +1254,12 @@ def gov_hamta_arendeforteckning(
             af_id = cur.fetchone()[0]
 
         conn.commit()
+
+        # Radera lokal PDF — fulltexten finns nu i databasen
+        try:
+            Path(pdf_sokvag).unlink(missing_ok=True)
+        except Exception as e:
+            log.warning(f"Kunde inte radera ärendeförtecknings-PDF {pdf_sokvag}: {e}")
 
         # Chunka och indexera
         chunks = [c for c in _chunka_text(fulltext) if _ar_svensk(c)]

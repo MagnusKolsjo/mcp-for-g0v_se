@@ -6,6 +6,7 @@ import os
 import json
 import time
 import logging
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -215,6 +216,7 @@ def behandla_ett_dokument(doc: dict, conn, use_postgres: bool) -> str:
             return f"FEL (nedladdning — {fel}): {doc.get('titel','')[:60]}"
         time.sleep(FORDROJNING)
 
+    ocr_sokvag = None
     text = extrahera_text(sokvag)
     if not text:
         log.info(f"Ingen text — försöker OCR-fallback: {sokvag.name}")
@@ -225,7 +227,72 @@ def behandla_ett_dokument(doc: dict, conn, use_postgres: bool) -> str:
         return f"FEL (extraktion misslyckades även efter OCR): {doc.get('titel','')[:60]}"
 
     uppdatera_dokument_med_fulltext(doc["id"], text, sokvag, conn, use_postgres)
+
+    # Radera PDF-filen direkt — fulltexten finns nu i databasen
+    for fil in [sokvag, ocr_sokvag]:
+        if fil and fil.exists():
+            try:
+                fil.unlink()
+            except Exception as e:
+                log.warning(f"Kunde inte radera PDF-fil {fil.name}: {e}")
+
     return f"OK ({len(text)} tecken): {doc.get('titel','')[:60]}"
+
+
+def stada_pdf_cache(conn, use_postgres: bool) -> dict:
+    """Raderar PDF-filer vars fulltext finns i databasen och som är äldre
+    än PDF_CACHE_TTL_DAGAR dagar (standard: 1 dag).
+
+    Täcker tabellerna dokument, remissvar och arendeforteckning.
+    Filer där fulltext_md IS NULL lämnas kvar för retry.
+    Returnerar statistik: {raderade, bevarade, fel}.
+    """
+    ttl_dagar  = int(os.getenv("PDF_CACHE_TTL_DAGAR", "1"))
+    gransvarde = datetime.utcnow() - timedelta(days=ttl_dagar)
+
+    cur = conn.cursor()
+    sokvagar: list[str] = []
+
+    tabeller_pg  = ["gov_data.dokument", "gov_data.remissvar", "gov_data.arendeforteckning"]
+    tabeller_sql = ["dokument", "remissvar", "arendeforteckning"]
+    tabeller     = tabeller_pg if use_postgres else tabeller_sql
+
+    for tabell in tabeller:
+        try:
+            cur.execute(
+                f"SELECT pdf_sokvag FROM {tabell} "
+                f"WHERE fulltext_md IS NOT NULL AND pdf_sokvag IS NOT NULL"
+            )
+            sokvagar.extend(r[0] for r in cur.fetchall() if r[0])
+        except Exception:
+            pass  # Tabellen kanske inte finns i SQLite-installationer
+
+    cur.close()
+
+    raderade = bevarade = fel = 0
+    for sokvag_str in sokvagar:
+        fil = Path(sokvag_str)
+        if not fil.exists():
+            continue
+        try:
+            andrad = datetime.utcfromtimestamp(fil.stat().st_mtime)
+            if andrad > gransvarde:
+                bevarade += 1
+                continue
+        except Exception:
+            pass
+        try:
+            fil.unlink()
+            raderade += 1
+        except Exception as e:
+            log.warning(f"Kunde inte radera {fil.name}: {e}")
+            fel += 1
+
+    log.info(
+        f"PDF-cache städad: {raderade} raderade, "
+        f"{bevarade} bevarade (yngre än {ttl_dagar} dag(ar)), {fel} fel"
+    )
+    return {"raderade": raderade, "bevarade": bevarade, "fel": fel}
 
 
 def hamta_dokument_for_bulk(typ_koder: set, hoppa_existerande: bool,

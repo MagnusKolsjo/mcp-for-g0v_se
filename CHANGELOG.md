@@ -4,6 +4,20 @@ Alla viktiga ändringar i detta projekt dokumenteras här.
 Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 
+## [2.3.0] — 2026-05-15
+
+### Tillagt
+- **PDF-cache TTL och automatisk städning:** Pipeline raderar nu PDF-filen direkt
+  efter lyckad extraktion till databasen i `behandla_ett_dokument()`,
+  `gov_hamta_remissvar()` och `gov_hamta_arendeforteckning()`. OCR-tempfiler
+  (`_ocr`-suffix) raderas också.
+- **`stada_pdf_cache()`** i `pdf_lib.py`: städar upp kvarliggande PDF-filer
+  där `fulltext_md IS NOT NULL` i databasen. Täcker tabellerna `dokument`,
+  `remissvar` och `arendeforteckning`. Körs automatiskt i slutet av varje
+  daglig synk via `03_synka_data.py`.
+- **`PDF_CACHE_TTL_DAGAR`** i `.env` (standard: 1 dag): säkerhetsventil som
+  bevarar filer yngre än angivet antal dagar även om fulltexten finns i DB.
+
 ## [2.2.1] — 2026-05-15
 
 ### Fixat
