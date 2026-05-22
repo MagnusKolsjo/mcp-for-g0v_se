@@ -27,7 +27,7 @@ Täcker lagrådsremisser, remissmissiv, förordningsmotiv, internationella
 ## Krav
 
 - Python 3.11+
-- PostgreSQL med pgvector-tillägget (rekommenderas) eller SQLite (fallback)
+- PostgreSQL med pgvector-tillägget (rekommenderas) eller SQLite (begränsat — semantisk sökning inaktiveras)
 - Tesseract OCR för bildbaserade PDF:er: `brew install tesseract tesseract-lang`
 - Internetåtkomst mot regeringen.se och g0v.se
 
@@ -50,7 +50,7 @@ Kopiera `config.example.env` till `.env` och fyll i:
 # PostgreSQL (rekommenderas — krävs för semantisk sökning)
 DATABASE_URL=postgresql://anvandare:losenord@localhost:5432/riksdag
 
-# SQLite-fallback (fungerar utan pgvector, semantisk sökning inaktiveras)
+# SQLite — utan pgvector (semantisk sökning inaktiveras)
 # DATABASE_URL=sqlite:///gov_cache.db
 
 # Transportläge för MCP-servern

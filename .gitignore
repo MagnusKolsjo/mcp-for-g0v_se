@@ -1,6 +1,8 @@
 .env
 pdf_cache/
 json_cache/
+logs/
+*.log
 *.db
 __pycache__/
 *.pyc

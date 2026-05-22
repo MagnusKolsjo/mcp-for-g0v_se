@@ -6,7 +6,7 @@ import os
 import json
 import time
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -56,7 +56,7 @@ LISTOR = [
 ]
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "gov-dokument-mcp/1.0 (riksdag-ai-research)"})
+SESSION.headers.update({"User-Agent": "mcp-for-g0v_se/1.0 (+https://github.com/MagnusKolsjo/mcp-for-g0v_se)"})
 
 
 def hamta_senast_uppdaterad() -> str:
@@ -91,7 +91,7 @@ def _json_eller_none(varde) -> Optional[str]:
     return json.dumps(varde, ensure_ascii=False)
 
 
-def upsert_dokument(poster: list[dict], typ_kod: str, conn, use_postgres: bool):
+def upsert_dokument(poster: list[dict], typ_kod: str, conn):
     """Lägger till eller uppdaterar dokumentposter i databasen.
 
     OBS: Fältnamnen i g0v.se:s JSON-svar är på engelska
@@ -101,8 +101,8 @@ def upsert_dokument(poster: list[dict], typ_kod: str, conn, use_postgres: bool):
     bilagor osv.) gäller bara för vår egen tabellstruktur. Att läsa
     g0v.se-fälten med svenska namn ger None och tappar tyst datakvalitet.
     """
-    cur = conn.cursor()
-    tabell = "gov_data.dokument" if use_postgres else "dokument"
+    cur    = conn.cursor()
+    tabell = f"{db._prefix()}dokument"
 
     for post in poster:
         url = post.get("url", "")
@@ -120,7 +120,7 @@ def upsert_dokument(poster: list[dict], typ_kod: str, conn, use_postgres: bool):
         publicerad = parse_datum(post.get("published"))
         uppdaterad = parse_datum(post.get("updated"))
 
-        if use_postgres:
+        if db._ar_postgres():
             cur.execute(f"""
                 INSERT INTO {tabell}
                     (url, typ_kod, titel, sammanfattning, publicerad, uppdaterad,
@@ -175,7 +175,7 @@ def kor(tvinga: bool = False):
     """
     db.initiera_schema()
 
-    senaste_kand = db.hamta_synkstatus("g0v_latest_updated")
+    senaste_kand = db.hamta_synkstatus("g0v_senast_uppdaterad")
     aktuell      = hamta_senast_uppdaterad()
     log.info(f"g0v.se senast uppdaterad: {aktuell} (senast känd: {senaste_kand})")
 
@@ -183,18 +183,17 @@ def kor(tvinga: bool = False):
         log.info("Ingen ny data på g0v.se. Avslutar.")
         return
 
-    conn          = db.get_conn()
-    use_postgres  = db.DATABASE_URL.startswith("postgresql")
-    totalt        = 0
+    conn   = db._hamta_db()
+    totalt = 0
 
     for endpoint, typ_kod in LISTOR:
         poster = hamta_lista(endpoint)
-        upsert_dokument(poster, typ_kod, conn, use_postgres)
+        upsert_dokument(poster, typ_kod, conn)
         totalt += len(poster)
         time.sleep(0.5)
 
     conn.close()
 
-    db.spara_synkstatus("g0v_latest_updated", aktuell)
-    db.spara_synkstatus("listor_senast_hämtade", datetime.utcnow().isoformat())
+    db.spara_synkstatus("g0v_senast_uppdaterad", aktuell)
+    db.spara_synkstatus("listor_senast_hamtade", datetime.now(timezone.utc).isoformat())
     log.info(f"Klart. {totalt} poster behandlade.")

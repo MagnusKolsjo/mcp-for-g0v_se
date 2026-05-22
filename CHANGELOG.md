@@ -4,6 +4,86 @@ Alla viktiga ändringar i detta projekt dokumenteras här.
 Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 
+## [3.0.0] — 2026-05-22
+
+### Brytande ändringar
+
+- **Extern SQL** — DDL flyttad ur `initiera_schema()` till `db/schema_postgres.sql`
+  och `db/schema_sqlite.sql`. Möjliggör granskning och diff utan att köra Python.
+- **Per-anrops-anslutning** — `db.py` exporterar nu `_ar_postgres()`, `_hamta_db()`,
+  `_ph()` och `_prefix()` istället för `get_conn()` och `_USE_POSTGRES`. Alla
+  anropare i `mcp_server.py`, `03_synka_data.py` och `hamta_listor_lib.py` uppdaterade.
+- **Synkstatusnycklar** — `g0v_latest_updated` → `g0v_senast_uppdaterad`,
+  `listor_senast_hämtade` → `listor_senast_hamtade`. Befintliga rader i
+  `synkstatus`-tabellen behöver migreras (se backfill-instruktioner i
+  `09-dokument-fran-regeringen-via-g0v_se.md`).
+- **Env-variabelnamn** — `PYTHON_SOKVÄG` → `PYTHON_SOKVAG` (tar bort Ä).
+
+### Fixat
+
+- **Bugg 1 — HTTP-läge fail-open:** `BearerTokenMiddleware` tillät anrop utan
+  autentisering när `MCP_API_KEY` var tom. Nu startar servern inte alls i HTTP-läge
+  om `MCP_API_KEY` saknas (`SystemExit` med tydligt felmeddelande).
+- **Bugg 2 — departement hamnade i `statsrad`:** `tolka_beslut_html()` placerade
+  departementsnamn i `statsrad`-kolumnen när bara ett värde parsades ur HTML.
+  Åtgärd: ny `_ar_departement()`-hjälpare som kontrollerar om värdet slutar på
+  `departementet`/`beredningen` och placerar det i rätt kolumn.
+- **Bugg 3 — `(pdf X kB)`-suffix och `"X av Y"`-prefix i remissinstansnamn:**
+  `_extrahera_remissinstans()` regex utökad med `(\d+\s*av\s*\d+\s*)?` för att
+  även ta bort ordningsmarkörer som `"3 av 3"` ur bilagenamnet.
+- **Beg.6 (kvarstående) — `id` exponerades i `gov_search_beslut` och
+  `gov_get_beslut_by_diarienummer`:** `id` borttaget ur SELECT-lista och returdict
+  i båda verktygen. `b.id` behålls i `SELECT DISTINCT` för `ORDER BY`-stöd men
+  exponeras inte i returstrukturen.
+
+### Förbättrat
+
+- **Beg.1 — prefix-detektion i `tolka_beslut_html()`:** Ny `_fixa_titel()`
+  detekterar kända prefix (`"Regeringens proposition"`, `"Lagrådsremiss"` m.fl.)
+  och infogar mellanslag om de saknas mot resterande titel.
+- **Beg.2 — SQLite-schema kompletterat:** `beslut`-tabellen får `vecka_nummer`/`vecka_ar`,
+  `arendeforteckning` och `arendeforteckning_chunks` läggs till.
+- **Beg.3 — Språkfiltrering i `gov_hamta_remissvar`:** `_ar_svensk()`-filter nu
+  applicerat vid chunkning av remissvar, precis som vid `gov_hamta_arendeforteckning`.
+- **Beg.4 — NULL-säkert vecka-filter i `gov_search_beslut`:** `IS NOT NULL`-villkor
+  för `vecka_ar`/`vecka_nummer`.
+- **Beg.5 — Ny chunkning (800 tecken + 200 tecken överlapp):** `_chunka_text()`
+  använder nu teckenbaserad gräns (800) med överlapp (200) istället för
+  ordbaserad gräns (400 ord).
+- **Beg.7 — Migrationsblock i `db/schema_*.sql`.**
+- **K3 — `"fallback"`-terminologi borttagen** ur `README.md` och `config.example.env`.
+- **K6 — Docstring-räknare uppdaterad** ("Nio verktyg" → "Tolv verktyg").
+- **K7 — `PYTHON_SOKVAG` i `config.example.env`** (tog bort Ä).
+- **K8 — Synkstatusnycklar** på ASCII-svenska genomgående.
+- **K10 — `synk_daglig.sh`** tillagd för enkel daglig körning från terminal eller launchd.
+- **`datetime.utcnow()` → `datetime.now(timezone.utc)`:**
+  Fyra förekomster i `03_synka_data.py`, `pdf_lib.py` och `hamta_listor_lib.py`.
+- **`use_postgres`-parameter borttagen ur hjälpfunktioner:**
+  `spara_beslut`, `synka_beslut`, `synka_nya_pdf` (`03_synka_data.py`);
+  `uppdatera_dokument_med_fulltext`, `behandla_ett_dokument`, `stada_pdf_cache`,
+  `hamta_dokument_for_bulk`, `kor` (`pdf_lib.py`); `upsert_dokument`, `kor`
+  (`hamta_listor_lib.py`). Alla anropar nu `db._ar_postgres()`, `db._ph()`,
+  `db._prefix()` direkt.
+- **`ORDER BY b.id` i `gov_get_beslut_by_diarienummer`:** Kronologisk sortering
+  återställd (ersatte felaktig `ORDER BY b.titel`). Docstring uppdaterad.
+- **NULL-guard i `gov_search_arendeforteckning` vecka-filter:**
+  `af.vecka_ar IS NOT NULL AND af.vecka_nummer IS NOT NULL` tillagt för
+  `from_date`- och `to_date`-grenarna.
+- **`04_indexera_chunks.py`:** Ny standalone bulk-indexeringsskript som kör utan
+  MCP-timeout och loggar hoppsatta dokument till `fel_indexering.log`.
+
+## [2.3.1] — 2026-05-17
+
+### Fixat
+- **MCP-servern kraschade när PostgreSQL var nere vid uppstart:** `db.initiera_schema()`
+  anropades utan try/except i `__main__`-blocket. När Postgres-containern råkade vara
+  nere (t.ex. efter omstart av datorn innan Docker startat) dog hela processen direkt
+  med `psycopg2.OperationalError: connection to server at "127.0.0.1", port 5432
+  failed: Connection refused`, och Claude Desktop loggade "Server transport closed
+  unexpectedly". Åtgärd: try/except runt anropet — fel loggas som varning men
+  servern startar ändå. Verktygsanrop felar tills DB är uppe, men användaren slipper
+  starta om Claude Desktop när containern startas i efterhand.
+
 ## [2.3.0] — 2026-05-15
 
 ### Tillagt
@@ -27,7 +107,7 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
   anropades. Åtgärd: funktionsdefinitionen flyttad till före `if __name__`-blocket.
 - **launchd-jobb saknades:** Ovanstående bugg innebar att `--installera-schema`
   aldrig körts framgångsrikt. Jobbet installerat manuellt efter fix
-  (`se.riksdag-ai.gov-dokument-synk.plist`, kör dagligen kl 06:45).
+  (`se.magnuskolsjo.mcp-gov-synk.plist`, kör dagligen kl 06:45). *(Omdöpt från `se.riksdag-ai.gov-dokument-synk` 2026-05-17)*
 
 ## [2.2.0] — 2026-05-11
 
@@ -148,7 +228,7 @@ tecken till ASCII-svenska enligt projektkonvention. Bland annat:
   `pg_temp.byt_tabell` och `pg_temp.byt_kolumn` som kontrollerar mot
   `information_schema` innan rename — gör skriptet idempotent.
 
-## [Unreleased]
+## [0.1.0] — 2026-04-xx (baslinje vid forsta GitHub-publicering)
 
 ### Tillagt
 - Initialt projekt: hämtning av JSON-listor från g0v.se
@@ -156,4 +236,4 @@ tecken till ASCII-svenska enligt projektkonvention. Bland annat:
 - MCP-server med 6 verktyg: gov_list_typer, gov_search, gov_get_document,
   gov_search_in_document, gov_search_beslut, gov_get_beslut_by_diarienummer
 - Daglig synkronisering via 03_synka_data.py
-- PostgreSQL-schema gov_data med pgvector-stöd, SQLite-fallback
+- PostgreSQL-schema gov_data med pgvector-stöd, SQLite som alternativt val

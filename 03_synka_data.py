@@ -22,7 +22,7 @@ import re
 import time
 import json
 import logging
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Optional
 
 import requests
@@ -57,9 +57,49 @@ FILTER_API_URL   = (
 # Dokumenttyper som ska ha PDF:er laddade ned vid synk
 BULK_TYPER = {"1326", "2099", "1332"}
 
+
+# Kända dokumenttyp-prefix som kan sakna mellanslag mot titeln i HTML-källan.
+# Exempel: "Regeringens propositionLagändringar för…" → "Regeringens proposition Lagändringar…"
+#
+# "Förordning"/"Förordningar" ingår inte: förordningsmotiv har egen typkod (1326)
+# och hanteras separat via hamta_listor_lib.py. "Promemoria" täcker den relevanta
+# beslutskategorin för beslutsregistret utan att krocka med förordningsflödet.
+_KANDA_BESLUTPREFIX = (
+    "Regeringens proposition",
+    "Regeringens skrivelse",
+    "Lagrådsremiss",
+    "Promemoria",
+    "Kommittédirektiv",
+)
+
+
+def _fixa_titel(titel: str) -> str:
+    """Infogar mellanslag efter känt dokumenttyp-prefix om det saknas.
+
+    HTML-parsaren ger ibland 'Regeringens propositionLagändringar för…'
+    när prefix och rubrik inte separeras av blanksteg i källan.
+    """
+    if not titel:
+        return titel
+    for prefix in _KANDA_BESLUTPREFIX:
+        if titel.startswith(prefix) and len(titel) > len(prefix):
+            rest = titel[len(prefix):]
+            if rest and rest[0] != " ":
+                return prefix + " " + rest
+    return titel
+
+
+def _ar_departement(varde: str) -> bool:
+    """True om strängen ser ut att vara ett departement snarare än ett statsråd.
+
+    Används när HTML-parsningen bara ger ett värde — departementnamn slutar
+    typiskt på 'departementet' eller 'beredningen'.
+    """
+    return varde.endswith("departementet") or varde.endswith("beredningen")
+
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; gov-dokument-mcp/1.0)",
+    "User-Agent": "mcp-for-g0v_se/1.0 (+https://github.com/MagnusKolsjo/mcp-for-g0v_se)",
     "Referer": REGERINGEN_BAS,
 })
 
@@ -93,9 +133,9 @@ def tolka_beslut_html(html_strang: str) -> list[dict]:
     for li in soup.find_all("li"):
         post = {}
 
-        # Titel (i <strong>)
+        # Titel (i <strong>) — normalisera prefix-sammanskrivningar
         rubrik = li.find("strong")
-        post["titel"] = rubrik.get_text(strip=True) if rubrik else None
+        post["titel"] = _fixa_titel(rubrik.get_text(strip=True)) if rubrik else None
 
         # Stycket med Regeringsärendenummer, Diarienummer, Chefstjänsteman
         stycken = li.find_all("p", class_="sortextended__excerpt")
@@ -129,10 +169,15 @@ def tolka_beslut_html(html_strang: str) -> list[dict]:
 
             delar = [d.strip() for d in efter_lank.split(",") if d.strip()]
             if len(delar) >= 2:
-                post["statsrad"] = delar[0]
+                post["statsrad"]   = delar[0]
                 post["departement"] = delar[1]
             elif len(delar) == 1:
-                post["statsrad"] = delar[0]
+                # Om bara ett värde — avgör om det är statsråd eller departement.
+                # Departement slutar typiskt på "departementet" eller "beredningen".
+                if _ar_departement(delar[0]):
+                    post["departement"] = delar[0]
+                else:
+                    post["statsrad"] = delar[0]
 
         if post.get("titel"):
             beslut.append(post)
@@ -140,13 +185,13 @@ def tolka_beslut_html(html_strang: str) -> list[dict]:
     return beslut
 
 
-def spara_beslut(beslutslista: list[dict], conn, use_postgres: bool) -> int:
+def spara_beslut(beslutslista: list[dict], conn) -> int:
     """Lagrar beslut i databasen. Returnerar antal nya poster."""
-    cur = conn.cursor()
-    tabell_b  = "gov_data.beslut" if use_postgres else "beslut"
-    tabell_d  = "gov_data.beslut_diarienummer" if use_postgres else "beslut_diarienummer"
-    plats     = "%s" if use_postgres else "?"
-    nya = 0
+    cur      = conn.cursor()
+    tabell_b = f"{db._prefix()}beslut"
+    tabell_d = f"{db._prefix()}beslut_diarienummer"
+    plats    = db._ph()
+    nya      = 0
 
     for b in beslutslista:
         # Kontrollera om beslutet redan finns (matcha på titel + vecka_url)
@@ -169,7 +214,7 @@ def spara_beslut(beslutslista: list[dict], conn, use_postgres: bool) -> int:
                  ansvarig_chefstjansteman, vecka_url, statsrad, departement,
                  vecka_nummer, vecka_ar)
             VALUES ({','.join([plats]*9)})
-            {'RETURNING id' if use_postgres else ''}
+            {'RETURNING id' if db._ar_postgres() else ''}
         """, (
             b.get("titel"),
             b.get("regeringsarendenummer"),
@@ -182,7 +227,7 @@ def spara_beslut(beslutslista: list[dict], conn, use_postgres: bool) -> int:
             vecka_ar,
         ))
 
-        if use_postgres:
+        if db._ar_postgres():
             beslut_id = cur.fetchone()[0]
         else:
             beslut_id = cur.lastrowid
@@ -203,7 +248,7 @@ def spara_beslut(beslutslista: list[dict], conn, use_postgres: bool) -> int:
     return nya
 
 
-def synka_beslut(conn, use_postgres: bool) -> int:
+def synka_beslut(conn) -> int:
     """Hämtar alla nya beslut sedan senaste synk och lagrar dem."""
     senaste = db.hamta_synkstatus("beslut_senast_indexerat_datum")
     if senaste:
@@ -232,7 +277,7 @@ def synka_beslut(conn, use_postgres: bool) -> int:
         alla_beslut.extend(tolka_beslut_html(svar.get("Message", "")))
         time.sleep(0.3)
 
-    nya = spara_beslut(alla_beslut, conn, use_postgres)
+    nya = spara_beslut(alla_beslut, conn)
     db.spara_synkstatus("beslut_senast_indexerat_datum", to_date)
     log.info(f"  {nya} nya beslut indexerade (av {len(alla_beslut)} hämtade)")
     return nya
@@ -242,14 +287,13 @@ def synka_beslut(conn, use_postgres: bool) -> int:
 # PDF-synk för bulk-typer
 # ---------------------------------------------------------------------------
 
-def synka_nya_pdf(conn, use_postgres: bool) -> int:
+def synka_nya_pdf(conn) -> int:
     """Laddar ned PDF:er för nya bulk-dokument som saknar fulltext."""
-    cur = conn.cursor()
-    tabell = "gov_data.dokument" if use_postgres else "dokument"
-    plats  = "%s" if use_postgres else "?"
-
+    cur       = conn.cursor()
+    tabell    = f"{db._prefix()}dokument"
     typ_lista = list(BULK_TYPER)
-    if use_postgres:
+
+    if db._ar_postgres():
         cur.execute(f"""
             SELECT id, url, typ_kod, titel, bilagor
             FROM {tabell}
@@ -277,7 +321,7 @@ def synka_nya_pdf(conn, use_postgres: bool) -> int:
     log.info(f"  {len(dokument)} nya bulk-dokument att ladda ned")
     ok = 0
     for doc in dokument:
-        status = behandla_ett_dokument(doc, conn, use_postgres)
+        status = behandla_ett_dokument(doc, conn)
         if status.startswith("OK"):
             ok += 1
         log.debug(status)
@@ -292,41 +336,40 @@ def synka_nya_pdf(conn, use_postgres: bool) -> int:
 
 def kor(tvinga: bool = False):
     db.initiera_schema()
-    conn = db.get_conn()
-    use_postgres = db.DATABASE_URL.startswith("postgresql")
+    conn = db._hamta_db()
 
     log.info("=== Daglig synk startar ===")
 
     # 1. g0v.se — metadata
-    senaste_kand = db.hamta_synkstatus("g0v_latest_updated")
+    senaste_kand = db.hamta_synkstatus("g0v_senast_uppdaterad")
     aktuell = listor.hamta_senast_uppdaterad()
     if tvinga or senaste_kand != aktuell:
         log.info("Ny data på g0v.se — uppdaterar JSON-listor")
-        listor_conn = db.get_conn()
+        listor_conn = db._hamta_db()
         for endpoint, typ_kod in listor.LISTOR:
             poster = listor.hamta_lista(endpoint)
-            upsert_dokument(poster, typ_kod, listor_conn, use_postgres)
+            upsert_dokument(poster, typ_kod, listor_conn)
             time.sleep(0.5)
         listor_conn.close()
-        db.spara_synkstatus("g0v_latest_updated", aktuell)
+        db.spara_synkstatus("g0v_senast_uppdaterad", aktuell)
         log.info("JSON-listor uppdaterade")
     else:
         log.info("Ingen ny data på g0v.se — hoppar över JSON-hämtning")
 
     # 2. PDF:er för nya bulk-dokument
-    nya_pdf = synka_nya_pdf(conn, use_postgres)
+    nya_pdf = synka_nya_pdf(conn)
     if nya_pdf:
         log.info(f"Laddade ned och indexerade {nya_pdf} nya PDF:er")
 
     # 3. Regeringsbeslut
-    nya_beslut = synka_beslut(conn, use_postgres)
+    nya_beslut = synka_beslut(conn)
 
     # 4. Städa PDF-cache — radera filer vars fulltext finns i databasen
     from pdf_lib import stada_pdf_cache
-    stada_pdf_cache(conn, use_postgres)
+    stada_pdf_cache(conn)
 
     conn.close()
-    db.spara_synkstatus("senaste_synk", datetime.utcnow().isoformat())
+    db.spara_synkstatus("senaste_synk", datetime.now(timezone.utc).isoformat())
     log.info(f"=== Synk klar — {nya_pdf} nya PDF:er, {nya_beslut} nya beslut ===")
 
 
@@ -349,7 +392,7 @@ def installera_schema(script_sokvag: str, python_sokvag: str):
             return
 
         plist_dir = Path.home() / "Library" / "LaunchAgents"
-        plist_fil = plist_dir / "se.riksdag-ai.gov-dokument-synk.plist"
+        plist_fil = plist_dir / "se.magnuskolsjo.mcp-gov-synk.plist"
         plist_dir.mkdir(parents=True, exist_ok=True)
 
         # Tolka timme och minut ur cron-schemat
@@ -362,7 +405,7 @@ def installera_schema(script_sokvag: str, python_sokvag: str):
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>se.riksdag-ai.gov-dokument-synk</string>
+    <string>se.magnuskolsjo.mcp-gov-synk</string>
     <key>ProgramArguments</key>
     <array>
         <string>{python_sokvag}</string>
@@ -417,7 +460,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.installera_schema:
-        python_sokvag = os.getenv("PYTHON_SOKVÄG", "python3")
+        python_sokvag = os.getenv("PYTHON_SOKVAG", "python3")
         installera_schema(__file__, python_sokvag)
     else:
         kor(tvinga=args.tvinga)

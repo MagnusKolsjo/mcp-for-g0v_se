@@ -6,7 +6,7 @@ import os
 import json
 import time
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -87,7 +87,7 @@ BULK_NAMN  = {"1326": "förordningsmotiv", "2099": "remissmissiv", "1332": "int.
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; gov-dokument-mcp/1.0; riksdag-ai-research)",
+    "User-Agent": "mcp-for-g0v_se/1.0 (+https://github.com/MagnusKolsjo/mcp-for-g0v_se)",
     "Referer": REGERINGEN_BAS,
 })
 
@@ -138,18 +138,17 @@ def extrahera_text(sokvag: Path) -> Optional[str]:
         return None
 
 
-def uppdatera_dokument_med_fulltext(doc_id: int, fulltext: str, sokvag: Path,
-                                    conn, use_postgres: bool):
+def uppdatera_dokument_med_fulltext(doc_id: int, fulltext: str, sokvag: Path, conn):
     """Sparar extraherad fulltext och PDF-sokvag i databasen."""
-    cur = conn.cursor()
-    tabell = "gov_data.dokument" if use_postgres else "dokument"
-    plats  = "%s" if use_postgres else "?"
+    cur    = conn.cursor()
+    tabell = f"{db._prefix()}dokument"
+    ph     = db._ph()
     cur.execute(f"""
         UPDATE {tabell}
-        SET fulltext_md = {plats},
-            fulltext_hamtad_vid = {'NOW()' if use_postgres else 'CURRENT_TIMESTAMP'},
-            pdf_sokvag = {plats}
-        WHERE id = {plats}
+        SET fulltext_md = {ph},
+            fulltext_hamtad_vid = {'NOW()' if db._ar_postgres() else 'CURRENT_TIMESTAMP'},
+            pdf_sokvag = {ph}
+        WHERE id = {ph}
     """, (fulltext, str(sokvag), doc_id))
     conn.commit()
     cur.close()
@@ -190,7 +189,7 @@ def ocr_pdf(sokvag: Path) -> Optional[Path]:
         log.warning(f"OCR misslyckades ({sokvag.name}): {e}")
         return None
 
-def behandla_ett_dokument(doc: dict, conn, use_postgres: bool) -> str:
+def behandla_ett_dokument(doc: dict, conn) -> str:
     """Laddar ned och extraherar text för ett enskilt dokument. Returnerar statussträng."""
     bilagor_raw = doc.get("bilagor")
     if isinstance(bilagor_raw, str):
@@ -226,7 +225,7 @@ def behandla_ett_dokument(doc: dict, conn, use_postgres: bool) -> str:
     if not text:
         return f"FEL (extraktion misslyckades även efter OCR): {doc.get('titel','')[:60]}"
 
-    uppdatera_dokument_med_fulltext(doc["id"], text, sokvag, conn, use_postgres)
+    uppdatera_dokument_med_fulltext(doc["id"], text, sokvag, conn)
 
     # Radera PDF-filen direkt — fulltexten finns nu i databasen
     for fil in [sokvag, ocr_sokvag]:
@@ -239,7 +238,7 @@ def behandla_ett_dokument(doc: dict, conn, use_postgres: bool) -> str:
     return f"OK ({len(text)} tecken): {doc.get('titel','')[:60]}"
 
 
-def stada_pdf_cache(conn, use_postgres: bool) -> dict:
+def stada_pdf_cache(conn) -> dict:
     """Raderar PDF-filer vars fulltext finns i databasen och som är äldre
     än PDF_CACHE_TTL_DAGAR dagar (standard: 1 dag).
 
@@ -248,14 +247,15 @@ def stada_pdf_cache(conn, use_postgres: bool) -> dict:
     Returnerar statistik: {raderade, bevarade, fel}.
     """
     ttl_dagar  = int(os.getenv("PDF_CACHE_TTL_DAGAR", "1"))
-    gransvarde = datetime.utcnow() - timedelta(days=ttl_dagar)
+    gransvarde = datetime.now(timezone.utc) - timedelta(days=ttl_dagar)
 
-    cur = conn.cursor()
+    cur      = conn.cursor()
     sokvagar: list[str] = []
-
-    tabeller_pg  = ["gov_data.dokument", "gov_data.remissvar", "gov_data.arendeforteckning"]
-    tabeller_sql = ["dokument", "remissvar", "arendeforteckning"]
-    tabeller     = tabeller_pg if use_postgres else tabeller_sql
+    tabeller = [
+        f"{db._prefix()}dokument",
+        f"{db._prefix()}remissvar",
+        f"{db._prefix()}arendeforteckning",
+    ]
 
     for tabell in tabeller:
         try:
@@ -275,7 +275,7 @@ def stada_pdf_cache(conn, use_postgres: bool) -> dict:
         if not fil.exists():
             continue
         try:
-            andrad = datetime.utcfromtimestamp(fil.stat().st_mtime)
+            andrad = datetime.fromtimestamp(fil.stat().st_mtime, tz=timezone.utc)
             if andrad > gransvarde:
                 bevarade += 1
                 continue
@@ -295,14 +295,13 @@ def stada_pdf_cache(conn, use_postgres: bool) -> dict:
     return {"raderade": raderade, "bevarade": bevarade, "fel": fel}
 
 
-def hamta_dokument_for_bulk(typ_koder: set, hoppa_existerande: bool,
-                             conn, use_postgres: bool) -> list[dict]:
+def hamta_dokument_for_bulk(typ_koder: set, hoppa_existerande: bool, conn) -> list[dict]:
     """Hämtar dokument ur databasen som ska bulk-laddas ned."""
-    cur    = conn.cursor()
-    tabell = "gov_data.dokument" if use_postgres else "dokument"
+    cur       = conn.cursor()
+    tabell    = f"{db._prefix()}dokument"
     typ_lista = list(typ_koder)
 
-    if use_postgres:
+    if db._ar_postgres():
         cur.execute(f"""
             SELECT id, url, typ_kod, titel, bilagor
             FROM {tabell}
@@ -336,13 +335,12 @@ def kor(typer: Optional[set] = None, hoppa_existerande: bool = True):
         typer:             Delmängd av BULK_TYPER att bearbeta (None = alla).
         hoppa_existerande: Om True hoppas dokument med befintlig fulltext över.
     """
-    valda_typer  = typer or BULK_TYPER
-    use_postgres = db.DATABASE_URL.startswith("postgresql")
+    valda_typer = typer or BULK_TYPER
 
     log.info(f"Startar bulk-nedladdning för: {[BULK_NAMN[t] for t in valda_typer]}")
 
-    conn      = db.get_conn()
-    dokument  = hamta_dokument_for_bulk(valda_typer, hoppa_existerande, conn, use_postgres)
+    conn     = db._hamta_db()
+    dokument = hamta_dokument_for_bulk(valda_typer, hoppa_existerande, conn)
     log.info(f"{len(dokument)} dokument att bearbeta.")
 
     if not dokument:
@@ -352,7 +350,7 @@ def kor(typer: Optional[set] = None, hoppa_existerande: bool = True):
 
     ok = fel = hoppade = 0
     for i, doc in enumerate(dokument, 1):
-        status = behandla_ett_dokument(doc, conn, use_postgres)
+        status = behandla_ett_dokument(doc, conn)
         if status.startswith("OK"):
             ok += 1
         elif status.startswith("HOPPAR"):

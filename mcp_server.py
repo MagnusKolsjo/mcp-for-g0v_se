@@ -1,7 +1,7 @@
 """
 mcp_server.py — MCP-server för regeringsdokument och regeringsbeslut.
 
-Nio verktyg:
+Tolv verktyg:
   gov_list_typer               — Lista dokumenttyper med antal poster
   gov_search                   — Sök i metadata för alla dokumenttyper
   gov_get_document             — Hämta ett dokument (fulltext on-demand för icke-bulk-typer)
@@ -131,10 +131,6 @@ def _datum_till_veckonyckel(datum_str: str):
     except Exception:
         return None
 
-def _use_postgres() -> bool:
-    return db.DATABASE_URL.startswith("postgresql")
-
-
 def _rad_till_dict_dokument(rad) -> dict:
     """Konverterar en databasrad till ett dokumentobjekt.
 
@@ -148,7 +144,6 @@ def _rad_till_dict_dokument(rad) -> dict:
     antal_bilagor = len(bilagor)
     har_remissvar = typ_kod == "2099" and antal_bilagor > 1
     return {
-        "id":            rad[0],
         "url":           rad[1],
         "typ":           TYP_NAMN.get(typ_kod, typ_kod),
         "typ_kod":       typ_kod,
@@ -170,29 +165,27 @@ def _hamta_pdf_vid_behov(doc_id: int, doc_url: str, bilagor) -> Optional[str]:
     Returnerar extraherad text eller None.
     """
     from pdf_lib import behandla_ett_dokument
-    conn = db.get_conn()
-    use_pg = _use_postgres()
 
     if isinstance(bilagor, str):
         bilagor = json.loads(bilagor)
 
     doc = {
-        "id": doc_id,
-        "url": doc_url,
+        "id":      doc_id,
+        "url":     doc_url,
         "typ_kod": "",
-        "titel": "",
+        "titel":   "",
         "bilagor": bilagor,
     }
-    status = behandla_ett_dokument(doc, conn, use_pg)
+    conn   = db._hamta_db()
+    status = behandla_ett_dokument(doc, conn)
     conn.close()
 
     if status.startswith("OK"):
-        # Hämta den nu sparade fulltexten
-        conn2 = db.get_conn()
-        cur = conn2.cursor()
-        tabell = "gov_data.dokument" if use_pg else "dokument"
-        plats  = "%s" if use_pg else "?"
-        cur.execute(f"SELECT fulltext_md FROM {tabell} WHERE id = {plats}", (doc_id,))
+        conn2  = db._hamta_db()
+        cur    = conn2.cursor()
+        tabell = f"{db._prefix()}dokument"
+        ph     = db._ph()
+        cur.execute(f"SELECT fulltext_md FROM {tabell} WHERE id = {ph}", (doc_id,))
         rad = cur.fetchone()
         cur.close()
         conn2.close()
@@ -211,9 +204,9 @@ def gov_list_typer() -> list[dict]:
 
     Returnerar en lista med: typ, typ_kod, antal, antal_med_fulltext, indexeringsstrategi.
     """
-    conn = db.get_conn()
+    conn = db._hamta_db()
     cur  = conn.cursor()
-    tabell = "gov_data.dokument" if _use_postgres() else "dokument"
+    tabell = "gov_data.dokument" if db._ar_postgres() else "dokument"
 
     cur.execute(f"""
         SELECT typ_kod,
@@ -289,8 +282,8 @@ def gov_search(
         "internationell-overenskommelse": "1332",
         "internationella-overenskommelser": "1332",  # synonym — pluralform
     }
-    use_pg = _use_postgres()
-    conn   = db.get_conn()
+    use_pg = db._ar_postgres()
+    conn   = db._hamta_db()
     cur    = conn.cursor()
     tabell = "gov_data.dokument" if use_pg else "dokument"
     plats  = "%s" if use_pg else "?"
@@ -361,8 +354,8 @@ def gov_get_document(url: str, hamta_fulltext: bool = True) -> dict:
     Returnerar: titel, typ, publicerad, sammanfattning, fulltext_md (eller None),
                 genvagar, bilagor (direktlänkar till regeringen.se).
     """
-    use_pg = _use_postgres()
-    conn   = db.get_conn()
+    use_pg = db._ar_postgres()
+    conn   = db._hamta_db()
     cur    = conn.cursor()
     tabell = "gov_data.dokument" if use_pg else "dokument"
     plats  = "%s" if use_pg else "?"
@@ -394,9 +387,9 @@ def gov_get_document(url: str, hamta_fulltext: bool = True) -> dict:
     doc["fulltext_md"] = fulltext
 
     # Chunka och indexera om fulltext finns och PostgreSQL används
-    if fulltext and _use_postgres() and doc_id:
+    if fulltext and db._ar_postgres() and doc_id:
         try:
-            conn2 = db.get_conn()
+            conn2 = db._hamta_db()
             _chunka_och_indexera_dokument(doc_id, fulltext, conn2)
             conn2.close()
         except Exception as e:
@@ -420,13 +413,13 @@ def gov_search_in_document(url: str, query: str, top_k: int = 5) -> list[dict]:
 
     Returnerar lista med chunk_text och relevanspoäng (cosinuslikhet).
     """
-    if not _use_postgres():
+    if not db._ar_postgres():
         return [{"fel": "Semantisk sökning kräver PostgreSQL med pgvector. SQLite stöds inte."}]
 
     modell = _hamta_modell()
     fraga_vektor = modell.encode(query).tolist()
 
-    conn = db.get_conn()
+    conn = db._hamta_db()
     cur  = conn.cursor()
 
     cur.execute("""
@@ -471,10 +464,10 @@ def gov_indexera_bulk(
 
     Returnerar: totalt_kvar, detta_batch, indexerade_chunks, nasta_index (null om klart).
     """
-    if not _use_postgres():
+    if not db._ar_postgres():
         return {"fel": "Bulk-indexering kräver PostgreSQL med pgvector."}
 
-    conn = db.get_conn()
+    conn = db._hamta_db()
     cur  = conn.cursor()
 
     batch_storlek = max(1, min(batch_storlek, 25))
@@ -549,8 +542,8 @@ def gov_search_beslut(
 
     Returnerar: totalt antal träffar, sida, poster (titel, diarienummer, statsråd, departement, vecka_url).
     """
-    use_pg = _use_postgres()
-    conn   = db.get_conn()
+    use_pg = db._ar_postgres()
+    conn   = db._hamta_db()
     cur    = conn.cursor()
     tabell = "gov_data.beslut" if use_pg else "beslut"
     plats  = "%s" if use_pg else "?"
@@ -568,13 +561,13 @@ def gov_search_beslut(
     if from_date:
         nyckel = _datum_till_veckonyckel(from_date)
         if nyckel is not None:
-            villkor.append(f"(vecka_ar * 100 + vecka_nummer) >= {plats}")
+            villkor.append(f"(vecka_ar IS NOT NULL AND vecka_nummer IS NOT NULL AND vecka_ar * 100 + vecka_nummer >= {plats})")
             params.append(nyckel)
 
     if to_date:
         nyckel = _datum_till_veckonyckel(to_date)
         if nyckel is not None:
-            villkor.append(f"(vecka_ar * 100 + vecka_nummer) <= {plats}")
+            villkor.append(f"(vecka_ar IS NOT NULL AND vecka_nummer IS NOT NULL AND vecka_ar * 100 + vecka_nummer <= {plats})")
             params.append(nyckel)
 
     if departement:
@@ -604,7 +597,7 @@ def gov_search_beslut(
     params_sida = params + [page_size, offset]
 
     cur.execute(f"""
-        SELECT id, titel, regeringsarendenummer, diarienummer_text,
+        SELECT titel, regeringsarendenummer, diarienummer_text,
                statsrad, departement, vecka_url
         FROM {tabell}
         WHERE {' AND '.join(villkor)}
@@ -614,13 +607,12 @@ def gov_search_beslut(
 
     poster = [
         {
-            "id":                    r[0],
-            "titel":                 r[1],
-            "regeringsarendenummer": r[2],
-            "diarienummer":          r[3],
-            "statsrad":              r[4],
-            "departement":           r[5],
-            "vecka_url":             r[6],
+            "titel":                 r[0],
+            "regeringsarendenummer": r[1],
+            "diarienummer":          r[2],
+            "statsrad":              r[3],
+            "departement":           r[4],
+            "vecka_url":             r[5],
         }
         for r in cur.fetchall()
     ]
@@ -649,10 +641,10 @@ def gov_get_beslut_by_diarienummer(diarienummer: str) -> list[dict]:
     Args:
         diarienummer: Diarienummer att söka på, t.ex. "Ju2023/00712".
 
-    Returnerar lista med beslut sorterade på id (kronologisk ordning).
+    Returnerar lista med beslut sorterade på registreringsordning (b.id, kronologisk).
     """
-    use_pg = _use_postgres()
-    conn   = db.get_conn()
+    use_pg = db._ar_postgres()
+    conn   = db._hamta_db()
     cur    = conn.cursor()
     tabell_b = "gov_data.beslut" if use_pg else "beslut"
     tabell_d = "gov_data.beslut_diarienummer" if use_pg else "beslut_diarienummer"
@@ -670,7 +662,6 @@ def gov_get_beslut_by_diarienummer(diarienummer: str) -> list[dict]:
 
     result = [
         {
-            "id":                    r[0],
             "titel":                 r[1],
             "regeringsarendenummer": r[2],
             "diarienummer":          r[3],
@@ -693,24 +684,54 @@ def gov_get_beslut_by_diarienummer(diarienummer: str) -> list[dict]:
 
 def _extrahera_remissinstans(bilage_namn: str) -> str:
     """Extraherar remissinstansens namn ur bilagenamnet.
-    "Tillväxtverket (pdf 376 kB)" → "Tillväxtverket"
+
+    Hanterar två mönster:
+      "Tillväxtverket (pdf 376 kB)"          → "Tillväxtverket"
+      "Finansdepartementet 3 av 3 (pdf 133 kB)" → "Finansdepartementet"
     """
-    return re.sub(r'\s*\(pdf[^)]*\)\s*$', '', bilage_namn, flags=re.IGNORECASE).strip()
+    return re.sub(
+        r'\s*(\d+\s*av\s*\d+\s*)?\(pdf[^)]*\)\s*$',
+        '',
+        bilage_namn,
+        flags=re.IGNORECASE,
+    ).strip()
 
 
-def _chunka_text(text: str, max_ord: int = 400) -> list[str]:
-    """Delar upp text i chunks om max max_ord ord, längs styckegränser."""
-    stycken = [s.strip() for s in text.split('\n\n') if s.strip()]
-    chunks, aktuell, ord_raknare = [], [], 0
+def _chunka_text(
+    text: str,
+    max_tecken: int = 800,
+    overlap_tecken: int = 200,
+) -> list[str]:
+    """Delar upp text i chunks om max max_tecken tecken med overlap_tecken tecken överlapp.
+
+    Delar längs styckegränser (dubbla radbrytningar). Chunk-gränsen dras
+    när ett nytt stycke skulle göra chunken längre än max_tecken. Överlappet
+    är de sista overlap_tecken tecknen från föregående chunk — detta ger
+    kontextkontinuitet vid semantisk sökning.
+    """
+    stycken  = [s.strip() for s in text.split("\n\n") if s.strip()]
+    chunks: list[str] = []
+    aktuell: list[str] = []
+    aktuell_len = 0
+
     for stycke in stycken:
-        ord_i_stycke = len(stycke.split())
-        if ord_raknare + ord_i_stycke > max_ord and aktuell:
-            chunks.append('\n\n'.join(aktuell))
-            aktuell, ord_raknare = [], 0
-        aktuell.append(stycke)
-        ord_raknare += ord_i_stycke
+        stycke_len = len(stycke)
+        separator_len = 2 if aktuell else 0  # "\n\n" räknas vid sammanslagning
+        if aktuell and aktuell_len + separator_len + stycke_len > max_tecken:
+            chunk_text = "\n\n".join(aktuell)
+            chunks.append(chunk_text)
+            # Overlap: ta de sista overlap_tecken tecknen och hitta närmaste
+            # styckegräns bakifrån för att inte dela mitt i ett ord.
+            overlap_text = chunk_text[-overlap_tecken:] if len(chunk_text) > overlap_tecken else chunk_text
+            aktuell      = [overlap_text, stycke]
+            aktuell_len  = len(overlap_text) + 2 + stycke_len
+        else:
+            aktuell.append(stycke)
+            aktuell_len += separator_len + stycke_len
+
     if aktuell:
-        chunks.append('\n\n'.join(aktuell))
+        chunks.append("\n\n".join(aktuell))
+
     return [c for c in chunks if len(c.strip()) > 50]
 
 
@@ -792,8 +813,8 @@ def gov_hamta_remissvar(
     from pdf_lib import ladda_ned_pdf, extrahera_text, pdf_cache_sokvag
     import time as _time
 
-    use_pg = _use_postgres()
-    conn   = db.get_conn()
+    use_pg = db._ar_postgres()
+    conn   = db._hamta_db()
     cur    = conn.cursor()
     tabell = "gov_data.dokument" if use_pg else "dokument"
     plats  = "%s" if use_pg else "?"
@@ -936,7 +957,9 @@ def gov_hamta_remissvar(
 
         # Chunka och embedda (endast PostgreSQL)
         if use_pg and rv_id:
-            chunks = _chunka_text(text)
+            chunks = [c for c in _chunka_text(text) if _ar_svensk(c)]
+            if not chunks:
+                chunks = _chunka_text(text)  # Behåll allt om inget bedöms vara svenska
             cur.execute(f"DELETE FROM {chunk_tab} WHERE remissvar_id = %s", (rv_id,))
             for i, chunk in enumerate(chunks):
                 vektor = modell.encode(chunk).tolist()
@@ -975,8 +998,8 @@ def gov_list_remissinstanser(remiss_url: str) -> list[dict]:
 
     Returnerar lista med: remissinstans, har_fulltext, cache_utgar_vid, bilage_url.
     """
-    use_pg = _use_postgres()
-    conn   = db.get_conn()
+    use_pg = db._ar_postgres()
+    conn   = db._hamta_db()
     cur    = conn.cursor()
     tabell = "gov_data.dokument" if use_pg else "dokument"
     rv_tab = "gov_data.remissvar" if use_pg else "remissvar"
@@ -1039,13 +1062,13 @@ def gov_search_remissvar(
 
     Returnerar lista med: remissinstans, chunk_text, relevans.
     """
-    if not _use_postgres():
+    if not db._ar_postgres():
         return [{"fel": "Semantisk sökning kräver PostgreSQL med pgvector."}]
 
     modell       = _hamta_modell()
     fraga_vektor = modell.encode(query).tolist()
 
-    conn = db.get_conn()
+    conn = db._hamta_db()
     cur  = conn.cursor()
 
     if remissinstans:
@@ -1154,7 +1177,7 @@ def gov_hamta_arendeforteckning(
     """
     if not ARENDEFORTECKNING_AKTIV:
         return {"fel": "Ärendeförteckningar är inaktiverade (ARENDEFORTECKNING_AKTIV=false i .env)."}
-    if not _use_postgres():
+    if not db._ar_postgres():
         return {"fel": "Ärendeförteckningar kräver PostgreSQL med pgvector."}
 
     import requests
@@ -1189,7 +1212,7 @@ def gov_hamta_arendeforteckning(
     vecka_nummer = int(vecka_match.group(1)) if vecka_match else None
     vecka_ar     = int(vecka_match.group(2)) if vecka_match else None
 
-    conn = db.get_conn()
+    conn = db._hamta_db()
     cur  = conn.cursor()
     nya_pdf = 0
     totalt_chunks = 0
@@ -1198,7 +1221,9 @@ def gov_hamta_arendeforteckning(
     cache_dir = os.path.join(_SCRIPT_DIR, os.getenv("PDF_CACHE_DIR", "pdf_cache"))
     os.makedirs(cache_dir, exist_ok=True)
 
-    for dept_namn, pdf_url in pdf_lankar:
+    for dept_namn_raa, pdf_url in pdf_lankar:
+        # Rensa bort eventuellt "(pdf X kB)"-suffix som HTMLen kan innehålla
+        dept_namn = _extrahera_remissinstans(dept_namn_raa)
         # Kolla om redan indexerad
         cur.execute(
             "SELECT id, fulltext_md FROM gov_data.arendeforteckning WHERE pdf_url = %s",
@@ -1320,13 +1345,13 @@ def gov_search_arendeforteckning(
 
     Returnerar: lista med chunk_text, departement, vecka, relevans.
     """
-    if not _use_postgres():
+    if not db._ar_postgres():
         return [{"fel": "Sökning kräver PostgreSQL med pgvector."}]
 
     modell = _hamta_modell()
     fraga_vektor = modell.encode(query).tolist()
 
-    conn = db.get_conn()
+    conn = db._hamta_db()
     cur  = conn.cursor()
 
     villkor = ["1=1"]
@@ -1335,12 +1360,12 @@ def gov_search_arendeforteckning(
     if from_date:
         nyckel = _datum_till_veckonyckel(from_date)
         if nyckel:
-            villkor.append("(af.vecka_ar * 100 + af.vecka_nummer) >= %s")
+            villkor.append("(af.vecka_ar IS NOT NULL AND af.vecka_nummer IS NOT NULL AND (af.vecka_ar * 100 + af.vecka_nummer) >= %s)")
             params.append(nyckel)
     if to_date:
         nyckel = _datum_till_veckonyckel(to_date)
         if nyckel:
-            villkor.append("(af.vecka_ar * 100 + af.vecka_nummer) <= %s")
+            villkor.append("(af.vecka_ar IS NOT NULL AND af.vecka_nummer IS NOT NULL AND (af.vecka_ar * 100 + af.vecka_nummer) <= %s)")
             params.append(nyckel)
     if departement:
         villkor.append("af.departement ILIKE %s")
@@ -1384,10 +1409,26 @@ def gov_search_arendeforteckning(
 
 if __name__ == "__main__":
     _log_path = _konfigurera_logging()
-    db.initiera_schema()
+    # Databasinitiering: fel loggas men kraschar inte servern. Detta gör att
+    # MCP-servern startar även om PostgreSQL-containern råkar vara nere vid
+    # Claude Desktops uppstart. Verktygsanrop kommer att fela tills DB är uppe,
+    # men servern överlever och behöver inte startas om manuellt.
+    try:
+        db.initiera_schema()
+    except Exception as exc:
+        log.warning("Databasinitiering misslyckades: %s — fortsätter utan DB", exc)
 
     if MCP_TRANSPORT == "http":
-        # HTTP-läge med Bearer-token-autentisering
+        # HTTP-läge med Bearer-token-autentisering.
+        # MCP_API_KEY är obligatoriskt i HTTP-läge — saknas den startar
+        # servern inte alls (fail-closed). Detta förhindrar att en
+        # felkonfigurerad server exponerar API:t utan autentisering.
+        if not MCP_API_KEY:
+            raise SystemExit(
+                "MCP_API_KEY är obligatoriskt när MCP_TRANSPORT=http. "
+                "Sätt nyckeln i .env och starta om."
+            )
+
         import uvicorn
         from starlette.applications import Starlette
         from starlette.middleware.base import BaseHTTPMiddleware
@@ -1395,10 +1436,9 @@ if __name__ == "__main__":
 
         class BearerTokenMiddleware(BaseHTTPMiddleware):
             async def dispatch(self, request, call_next):
-                if MCP_API_KEY:
-                    auth = request.headers.get("Authorization", "")
-                    if auth != f"Bearer {MCP_API_KEY}":
-                        return Response("Obehörig", status_code=401)
+                auth = request.headers.get("Authorization", "")
+                if auth != f"Bearer {MCP_API_KEY}":
+                    return Response("Obehörig", status_code=401)
                 return await call_next(request)
 
         # Preladdning av embeddingmodell i HTTP-läge
