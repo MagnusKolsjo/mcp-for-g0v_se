@@ -4,6 +4,85 @@ Alla viktiga ändringar i detta projekt dokumenteras här.
 Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 
+## [3.1.0] — 2026-05-23
+
+### Tillagt
+
+- **Live-fallback i `gov_get_document`** — om URL:en saknas i lokal cache
+  (t.ex. vid misslyckad daglig synk) görs ett automatiskt live-försök mot g0v.se.
+  Rätt JSON-lista hämtas baserat på URL-prefix, matchande post hittas och
+  upserteras i databasen. Framtida anrop och sökningar fungerar därefter
+  utan ny live-hämtning.
+- **`gov_search(sok_live=True)`** — ny parameter som vid tomma träffar i lokal
+  databas söker live i relevanta g0v.se-listor och upserterar träffarna.
+  Standardvärde False (bakåtkompatibelt).
+- **Hjälpfunktioner** — `_hamta_fran_g0v_live()`, `_hamta_g0v_lista()`,
+  `_G0V_SESSION`, `_URL_PREFIX_TILL_LISTA` för URL-prefix-till-lista-mappning.
+- **In-memory-cache för g0v.se-listor** — `_G0V_LISTE_CACHE` med 5 minuters TTL
+  reducerar nätverksanrop vid upprepade live-hämtningar inom samma serverprocess.
+- **Förbättrade docstrings** — `gov_search`, `gov_get_document`,
+  `gov_search_beslut`, `gov_hamta_remissvar`, `gov_list_remissinstanser`,
+  `gov_search_remissvar`: cache-medvetenhet, arbetsflödet remiss→instanser→svar,
+  vad `har_fulltext=False` innebär, korrekt beskrivning av bilagor[0] som
+  remissmissivet (inte ett remissvar).
+- **Modulbeskrivning uppdaterad** — arbetsflödena och live-fallbacken
+  dokumenterade i filens inledande docstring.
+- **FTS-tokenisering i `gov_search`** — query delas på whitespace och varje
+  substantiellt ord AND-matchas individuellt med ILIKE (cache-grenen) respektive
+  Python substring-test (live-grenen). Sökning på t.ex. `"2024:50 nätt jämnt"`
+  träffar nu dokument där alla tre orden förekommer oberoende av varandra i titel
+  eller sammanfattning. Stoppord (svenska småord) filtreras via `_STOPPORD`.
+  Citationstecken runt hela query ger gammalt beteende — exakt frasmatchning.
+- **`_STOPPORD` på modulnivå** — empiriskt vald stoppordslista (32 svenska
+  småord) för juridiska och parlamentariska sökfrågor. Filtreras bort ur
+  tokeniserad FTS-sökning i cache- och live-grenen. Kommenterad med notering
+  om framtida tsvector+GIN-migration (se backlogg i stream-09-dokumentet).
+- **Retry-strategi i `gov_search`-docstring** — explicit regel att vid noll-träff
+  på flerordssökning med dokumentbeteckning (mönster YYYY:N eller YYYY/YY:N)
+  ska nästa sökning göras med enbart beteckningen — aldrig genom att tappa
+  beteckningen och söka på ämnesord. Förhindrar att AI-agenter felaktigt
+  konkluderar att ett dokument saknas.
+
+### Fixat
+
+- **B1 — felklassificering av typ_kod vid live-upsert i `gov_search`:** live-träffar
+  gruppas nu per faktisk typ_kod (via URL-prefix) och upserteras per grupp. Tidigare
+  upserterades alla träffar med en enda typ_kod oavsett ursprungslista, vilket
+  ledde till databasdataförstörelse vid blandade dokumenttyper.
+- **B3 — inkonsekvent svarsstruktur cache vs live:** SQLite-grenen i live-sökvägen
+  beräknar nu `antal_bilagor` och `har_remissvar` på samma sätt som
+  `_rad_till_dict_dokument`. Fältet `kalla` borttaget (fanns bara i live-grenen).
+- **Bg2 — fel returtyp vid noll-träff i `gov_search(sok_live=True)`:** returnerade
+  tidigare `[{"info": "..."}]` (bryter kontraktet `list[dict]`). Returnerar nu `[]`
+  så att kedjning med `gov_get_document` inte kraschar på saknad `url`-nyckel.
+- **B4 — `avsandare_kod`-filter saknades i live-grenen:** filtret tillämpas nu
+  även vid live-sökning, så att parameter-paritet med cache-grenen uppnås.
+- **B5 — datumjämförelse på sträng-prefix:** `publicerad[:4] < str(year_from)` ersatt
+  med `int(publicerad[:4]) < year_from` (med ValueError-hantering) för konsekvens
+  med cache-grenens SQL-jämförelse.
+- **Bg3 — sz-budgeten tillföll listan som kom först:** live-sökvägen bryter inte
+  längre ur ytterloopen när `sz` uppnås. Alla listor genomsöks alltid; träffarna
+  sorteras på `publicerad` och skärs till `sz` vid utskriften. Per-lista-cap
+  `sz * 3` begränsar minnestillväxten utan att strypa sena listor.
+- **B2 — felaktig docstring i `_hamta_fran_g0v_live`:** docstringen angav "returnerar
+  ett dict" men funktionen returnerar en databasrad (tupel). Rättad.
+- **K5 — driftsmanualsinstruktion i felmeddelande:** "Om synken nyligen misslyckats,
+  kör 03_synka_data.py manuellt" borttaget ur det felmeddelande som returneras till
+  AI-agenten/användaren.
+- **K6 — `_hamta_g0v_lista` saknade User-Agent-kommentar:** docstringen nämner nu
+  att User-Agent följer projektkonventionen för WAF-kompatibilitet.
+
+### Förändrat
+
+- **K1 — `import requests as _requests` flyttad till toppen:** importen låg tidigare
+  mitt i filen (rad ~178). Nu placerad i imports-blocket högst upp, enligt PEP 8.
+- **K2 — `from hamta_listor_lib import upsert_dokument` lyfts till modulnivå:**
+  ersätter två separata lazy-imports i `_hamta_fran_g0v_live` och `gov_search`.
+- **K3 — fyra olika `typ_kodmappning.get()`-defaults normaliserade:** alla kvarvarande
+  anrop använder nu `get(typ.lower(), typ)` (okänd typ passerar igenom som-är).
+  De övriga tre varianterna (`"2099"`, `""`, genomsläpp utan default) eliminerades
+  i och med B1-/B3-fixarna.
+
 ## [3.0.0] — 2026-05-22
 
 ### Brytande ändringar

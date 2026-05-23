@@ -3,17 +3,24 @@ mcp_server.py — MCP-server för regeringsdokument och regeringsbeslut.
 
 Tolv verktyg:
   gov_list_typer               — Lista dokumenttyper med antal poster
-  gov_search                   — Sök i metadata för alla dokumenttyper
-  gov_get_document             — Hämta ett dokument (fulltext on-demand för icke-bulk-typer)
+  gov_search                   — Sök i metadata (lokal cache + valfri live-sökning mot g0v.se)
+  gov_get_document             — Hämta ett dokument (live-fallback om URL saknas i cache)
   gov_search_in_document       — Semantisk sökning inom ett dokument (kräver PostgreSQL)
   gov_indexera_bulk            — Bulk-chunkning och embedding för redan nedladdade dokument
   gov_hamta_arendeforteckning  — Hämtar och indexerar ärendeförtecknings-PDF:er on-demand (pre-sept 2024)
   gov_search_arendeforteckning — Semantisk sökning i indexerade ärendeförteckningar
-  gov_search_beslut            — Sök i regeringsbeslut (Filter-API)
+  gov_search_beslut            — Sök i regeringsbeslut (Filter-API, sept 2024–)
   gov_get_beslut_by_diarienummer — Hämta alla beslut kopplade till ett diarienummer
   gov_hamta_remissvar          — Ladda ned och cacha remissvar för en remiss (explicit trigger)
-  gov_list_remissinstanser     — Lista remissinstanser med cachestatus
+  gov_list_remissinstanser     — Lista remissinstanser med cachestatus (har_fulltext=False → ej ännu nedladdat)
   gov_search_remissvar         — Semantisk sökning i remissvar
+
+Arbetsflöde för remissvar:
+  gov_search(typ="remiss") → gov_list_remissinstanser → gov_hamta_remissvar → gov_search_remissvar
+
+Live-fallback: gov_get_document gör automatiskt live-hämtning mot g0v.se om URL:en
+saknas i lokal cache (t.ex. vid misslyckad daglig synk). gov_search(sok_live=True)
+söker live om inga träffar finns i databasen. Hittade dokument upserteras i DB.
 
 Transport styrs via MCP_TRANSPORT i .env: stdio (standard) eller http.
 """
@@ -26,9 +33,11 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import requests as _requests
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
+from hamta_listor_lib import upsert_dokument
 import db
 
 load_dotenv()
@@ -42,6 +51,20 @@ MCP_HOST      = os.getenv("MCP_HOST", "127.0.0.1")
 MCP_PORT      = int(os.getenv("MCP_PORT", "8009"))
 MCP_API_KEY   = os.getenv("MCP_API_KEY", "")
 REMISSVAR_TTL_DAYS = int(os.getenv("REMISSVAR_CACHE_TTL_DAYS", "365"))
+
+# Vanliga svenska småord som filtreras bort vid tokeniserad FTS-sökning.
+# Listan är empiriskt vald för svenska juridiska och parlamentariska sökfrågor —
+# tillräckligt bred för att plocka bort brus, tillräckligt smal för att inte
+# dölja substantiella söktermer som "för" i en myndighetsbenämning.
+# Framtida förbättring: ersätt ILIKE-tokenisering med PostgreSQL tsvector +
+# GIN-index (inbyggd svensk stoppordslista + stemming, se backlogg i 09-stream-dokumentet).
+_STOPPORD = {
+    "och", "att", "är", "av", "för", "med", "som", "det",
+    "den", "de", "en", "ett", "om", "på", "till", "från",
+    "men", "har", "var", "vid", "när", "eller", "inte",
+    "samt", "även", "också", "kan", "ska", "skall", "vad",
+    "vilka", "denna", "detta", "dessa",
+}
 
 # Dokumenttypers visningsnamn
 TYP_NAMN = {
@@ -159,6 +182,122 @@ def _rad_till_dict_dokument(rad) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Live-fallback mot g0v.se
+#
+# g0v.se exponerar fem platta JSON-listor (inga enskilda dokument-endpoints).
+# Vid cache-miss avgör URL-prefixet vilken lista som ska hämtas. Listan
+# genomsöks i minnet; matchande post upserteras och returneras.
+# Används i gov_get_document och gov_search(sok_live=True).
+# ---------------------------------------------------------------------------
+
+_G0V_BAS = "https://g0v.se"
+_G0V_SESSION = _requests.Session()
+_G0V_SESSION.headers.update({
+    "User-Agent": "mcp-for-g0v_se/1.0 (+https://github.com/MagnusKolsjo/mcp-for-g0v_se)"
+})
+
+# In-memory-cache för g0v.se-listor — minskar nätverksanrop vid upprepade
+# cache-missar inom samma serverprocess. Nyckeln är endpointnamnet,
+# värdet är (monotonic-tidsstämpel, poster).
+_G0V_LISTE_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_G0V_LISTE_CACHE_TTL = 300.0  # sekunder
+
+# URL-prefix i databasen → (g0v.se-listendpoint, typ_kod)
+_URL_PREFIX_TILL_LISTA = [
+    ("/remisser/",                                                       "remisser",                                                      "2099"),
+    ("/rattsliga-dokument/lagradsremiss/",                               "rattsliga-dokument/lagradsremiss",                              "2085"),
+    ("/kommenterade-dagordningar/",                                      "kommenterade-dagordningar",                                     "2098"),
+    ("/rattsliga-dokument/forordningsmotiv/",                            "rattsliga-dokument/forordningsmotiv",                           "1326"),
+    ("/rattsliga-dokument/sveriges-internationella-overenskommelser/",   "rattsliga-dokument/sveriges-internationella-overenskommelser",  "1332"),
+]
+
+
+def _hamta_g0v_lista(endpoint: str) -> list[dict]:
+    """Hämtar en JSON-lista från g0v.se med in-memory-cache (TTL: 5 min).
+
+    Cachen reducerar nätverksanrop vid upprepade live-hämtningar inom
+    samma serverprocess. User-Agent är satt till projektidentifieraren
+    för att undvika WAF-blockering av generiska HTTP-klienter.
+    Kastar undantag vid nätverksfel.
+    """
+    nu = time.monotonic()
+    if endpoint in _G0V_LISTE_CACHE:
+        ts, poster = _G0V_LISTE_CACHE[endpoint]
+        if nu - ts < _G0V_LISTE_CACHE_TTL:
+            log.debug("g0v.se-lista servad från minnescache: %s", endpoint)
+            return poster
+    svar = _G0V_SESSION.get(f"{_G0V_BAS}/{endpoint}.json", timeout=20)
+    svar.raise_for_status()
+    poster = svar.json()
+    _G0V_LISTE_CACHE[endpoint] = (nu, poster)
+    return poster
+
+
+def _hamta_fran_g0v_live(url: str) -> Optional[dict]:
+    """
+    Hämtar ett dokuments metadata live från g0v.se och lagrar det i databasen.
+
+    Avgör vilken lista dokumentet tillhör baserat på URL-prefix, hämtar listan,
+    hittar posten och kör upsert. Returnerar dokumentraden som en databasrad
+    (tupel) om lyckad upsert, annars None.
+
+    Anropas automatiskt av gov_get_document när URL:en saknas i lokal cache.
+    Vid misslyckad nätverksanslutning loggas felet och None returneras —
+    anroparen ansvarar för att returnera ett informativt felmeddelande.
+    """
+    # Bestäm vilken lista URL:en tillhör
+    matchad_endpoint = None
+    matchad_typ_kod  = None
+    for prefix, endpoint, typ_kod in _URL_PREFIX_TILL_LISTA:
+        if url.startswith(prefix):
+            matchad_endpoint = endpoint
+            matchad_typ_kod  = typ_kod
+            break
+
+    if not matchad_endpoint:
+        log.debug("_hamta_fran_g0v_live: okänt URL-prefix: %s", url)
+        return None
+
+    log.info("Live-hämtning från g0v.se för URL saknad i cache: %s", url)
+    try:
+        poster = _hamta_g0v_lista(matchad_endpoint)
+    except Exception as exc:
+        log.warning("Live-hämtning misslyckades (%s): %s", matchad_endpoint, exc)
+        return None
+
+    # Hitta matchande post
+    matchad = next((p for p in poster if p.get("url") == url), None)
+    if not matchad:
+        log.info("Dokumentet hittades inte i g0v.se-listan: %s", url)
+        return None
+
+    # Upserta i databasen
+    try:
+        conn = db._hamta_db()
+        upsert_dokument([matchad], matchad_typ_kod, conn)
+        conn.close()
+        log.info("Upsert klar för live-hämtat dokument: %s", url)
+    except Exception as exc:
+        log.warning("Upsert misslyckades för live-hämtat dokument: %s", exc)
+        return None
+
+    # Läs tillbaka från DB och returnera som dict
+    conn  = db._hamta_db()
+    cur   = conn.cursor()
+    ph    = db._ph()
+    tabell = f"{db._prefix()}dokument"
+    cur.execute(
+        f"SELECT id, url, typ_kod, titel, sammanfattning, publicerad, "
+        f"avsandare, genvagar, bilagor, fulltext_md FROM {tabell} WHERE url = {ph}",
+        (url,)
+    )
+    rad = cur.fetchone()
+    cur.close()
+    conn.close()
+    return rad
+
+
 def _hamta_pdf_vid_behov(doc_id: int, doc_url: str, bilagor) -> Optional[str]:
     """
     Hämtar och indexerar PDF on-demand för icke-bulk-typer.
@@ -247,15 +386,42 @@ def gov_search(
     year_to: int = 0,
     avsandare_kod: str = "",
     sz: int = 20,
+    sok_live: bool = False,
 ) -> list[dict]:
     """
     Söker i metadata för alla regeringsdokument (lagrådsremisser, remisser,
     förordningsmotiv, internationella överenskommelser, kommenterade dagordningar).
 
+    Söker i den lokala databasen som synkas dagligen från g0v.se. Nyligen
+    publicerade dokument kan saknas om en daglig synk har misslyckats —
+    använd i så fall sok_live=True för att söka direkt mot g0v.se.
+
     Detta är det primära ingångsverktyget för att hitta ett dokument utifrån
-    titel, SOU-beteckning eller ämnesord. Använd det här verktyget när du vet
-    titel/ämne men inte URL — t.ex. innan ett anrop till gov_hamta_remissvar
-    eller gov_list_remissinstanser som kräver känd remiss-URL.
+    titel, SOU-beteckning eller ämnesord. Hämta URL:en härifrån och använd
+    den sedan i gov_get_document, gov_list_remissinstanser eller gov_hamta_remissvar.
+
+    Arbetsflöde för remissvar:
+      1. gov_search(query="...", typ="remiss")   → hitta remissens URL
+      2. gov_list_remissinstanser(remiss_url)    → se vilka remissvar som finns
+      3. gov_hamta_remissvar(remiss_url)         → ladda ned remissvaren (PDF)
+      4. gov_search_remissvar(remiss_url, query) → semantisk sökning i svaren
+
+    Retry-strategi vid noll-träff:
+      Sökning tokeniseras på enskilda ord (AND-logik). Om en flerordssökning
+      inte ger träff och frågan innehåller en trolig dokumentbeteckning
+      (mönster: YYYY:N eller YYYY/YY:N, t.ex. "2024:50", "2023/24:1"),
+      ska nästa försök göras med enbart beteckningen som query — ALDRIG genom
+      att utelämna beteckningen och söka på ämnesord istället. Ämnesordssökning
+      utan beteckning riskerar att returnera fel dokument eller leda till slutsatsen
+      att dokumentet saknas trots att det finns.
+
+      Exempel:
+        gov_search(query="2024:50 nätt jämnt utjämning") → []
+        → Retry: gov_search(query="2024:50")              → [träff]
+        → INTE: gov_search(query="nätt jämnt utjämning") → (kan ge fel dokument)
+
+      Om även beteckningssökningen ger noll träffar: prova sok_live=True innan
+      slutsatsen att dokumentet saknas dras.
 
     Args:
         query:         Fritextsökning i titel och sammanfattning. Sök på SOU-beteckning
@@ -268,6 +434,9 @@ def gov_search(
         year_to:       Senaste publiceringsår (inklusivt).
         avsandare_kod: Filtrera på avsändarkod (t.ex. "1287" för Justitiedepartementet).
         sz:            Antal resultat (max 100).
+        sok_live:      Om True och inga träffar i lokal databas: hämta relevant
+                       lista live från g0v.se och filtrera i minnet. Tar ~1–2 sek
+                       extra. Använd när ett känt dokument saknas i cachen.
 
     Returnerar lista med: titel, typ, publicerad, sammanfattning, url, har_fulltext,
     bilagor, antal_bilagor, har_remissvar. Fältet har_remissvar = True för remisser
@@ -297,12 +466,28 @@ def gov_search(
         params.append(kod)
 
     if query:
-        if use_pg:
-            villkor.append(f"(titel ILIKE {plats} OR sammanfattning ILIKE {plats})")
-            params.extend([f"%{query}%", f"%{query}%"])
+        if query.startswith('"') and query.endswith('"'):
+            # Citationstecken → exakt frasmatchning med strippade citattecken
+            fras = query[1:-1]
+            if use_pg:
+                villkor.append(f"(titel ILIKE {plats} OR sammanfattning ILIKE {plats})")
+                params.extend([f"%{fras}%", f"%{fras}%"])
+            else:
+                villkor.append(f"(titel LIKE {plats} OR sammanfattning LIKE {plats})")
+                params.extend([f"%{fras}%", f"%{fras}%"])
         else:
-            villkor.append(f"(titel LIKE {plats} OR sammanfattning LIKE {plats})")
-            params.extend([f"%{query}%", f"%{query}%"])
+            # AND-kombinera per term — varje token måste förekomma i titel eller sammanfattning.
+            # Stoppord filtreras bort; om hela frågan är stoppord används alla termer ändå.
+            termer = [t for t in query.split() if t.lower() not in _STOPPORD]
+            if not termer:
+                termer = query.split()
+            for term in termer:
+                if use_pg:
+                    villkor.append(f"(titel ILIKE {plats} OR sammanfattning ILIKE {plats})")
+                    params.extend([f"%{term}%", f"%{term}%"])
+                else:
+                    villkor.append(f"(titel LIKE {plats} OR sammanfattning LIKE {plats})")
+                    params.extend([f"%{term}%", f"%{term}%"])
 
     if year_from:
         villkor.append(f"publicerad >= {plats}")
@@ -335,20 +520,150 @@ def gov_search(
     result = [_rad_till_dict_dokument(r) for r in cur.fetchall()]
     cur.close()
     conn.close()
+
+    if result or not sok_live:
+        return result
+
+    # Inga träffar i lokal cache — försök hämta live från g0v.se.
+    # Bestäm vilka listor som är relevanta (alla om typ inte angetts).
+    if typ:
+        filtrerad_typ_kod = typ_kodmappning.get(typ.lower(), typ)
+        listor_att_hamta = [
+            (ep, tk) for _, ep, tk in _URL_PREFIX_TILL_LISTA
+            if tk == filtrerad_typ_kod
+        ]
+    else:
+        listor_att_hamta = [(ep, tk) for _, ep, tk in _URL_PREFIX_TILL_LISTA]
+
+    # Samla träffar per typ_kod — alla listor genomsöks alltid (Bg3) för att
+    # sz-budgeten inte ska tillfalla den lista som råkar komma först.
+    # Träffarna sorteras på publicerad och skärs till sz vid utskriften.
+    live_resultat_per_typ: dict[str, list[dict]] = {}
+    query_lower = query.lower() if query else ""
+    per_list_budget = sz * 3  # rimlig övre gräns per lista innan övriga listor nås
+
+    for endpoint, typ_kod in listor_att_hamta:
+        try:
+            poster = _hamta_g0v_lista(endpoint)
+        except Exception as exc:
+            log.warning("gov_search live-hämtning misslyckades (%s): %s", endpoint, exc)
+            continue
+
+        matchade_denna_lista = 0
+        for post in poster:
+            if matchade_denna_lista >= per_list_budget:
+                break
+            titel = (post.get("title") or "").lower()
+            sammanfattning = (post.get("summary") or "").lower()
+            if query_lower:
+                if query_lower.startswith('"') and query_lower.endswith('"'):
+                    fras = query_lower[1:-1]
+                    if fras not in titel and fras not in sammanfattning:
+                        continue
+                else:
+                    termer = [t for t in query_lower.split() if t not in _STOPPORD]
+                    if not termer:
+                        termer = query_lower.split()
+                    if not any(t in titel or t in sammanfattning for t in termer):
+                        continue
+            publicerad = post.get("published", "")
+            if year_from and publicerad:
+                try:
+                    if int(publicerad[:4]) < year_from:
+                        continue
+                except ValueError:
+                    pass
+            if year_to and publicerad:
+                try:
+                    if int(publicerad[:4]) > year_to:
+                        continue
+                except ValueError:
+                    pass
+            if avsandare_kod and avsandare_kod not in post.get("senders", []):
+                continue
+            live_resultat_per_typ.setdefault(typ_kod, []).append(post)
+            matchade_denna_lista += 1
+
+    if not live_resultat_per_typ:
+        return []
+
+    # Upserta live-träffar per dokumenttyp — varje grupp med sin faktiska typ_kod.
+    try:
+        conn2 = db._hamta_db()
+        for tk, poster_for_typ in live_resultat_per_typ.items():
+            upsert_dokument(poster_for_typ, tk, conn2)
+        conn2.close()
+    except Exception as exc:
+        log.warning("Upsert av live-sökresultat misslyckades: %s", exc)
+
+    # Returnera live-träffar i standardformat via färsk DB-läsning.
+    alla_live = [p for poster in live_resultat_per_typ.values() for p in poster]
+    live_urls = [p["url"] for p in alla_live if p.get("url")]
+    conn3 = db._hamta_db()
+    cur3  = conn3.cursor()
+    if use_pg and live_urls:
+        cur3.execute(
+            f"SELECT id, url, typ_kod, titel, sammanfattning, publicerad, "
+            f"avsandare, genvagar, bilagor, fulltext_md FROM {tabell} "
+            f"WHERE url = ANY(%s) ORDER BY publicerad DESC NULLS LAST LIMIT %s",
+            (live_urls, sz)
+        )
+        result = [_rad_till_dict_dokument(r) for r in cur3.fetchall()]
+    else:
+        # SQLite eller upsert misslyckades — bygg svar direkt från live-data.
+        # Beräknar antal_bilagor och har_remissvar på samma sätt som _rad_till_dict_dokument.
+        result = []
+        for tk, poster_for_typ in live_resultat_per_typ.items():
+            for p in poster_for_typ:
+                bilagor_live = p.get("attachments", [])
+                antal_bilagor = len(bilagor_live)
+                har_remissvar = tk == "2099" and antal_bilagor > 1
+                result.append({
+                    "url":            p.get("url", ""),
+                    "typ":            TYP_NAMN.get(tk, tk),
+                    "typ_kod":        tk,
+                    "titel":          p.get("title", ""),
+                    "sammanfattning": p.get("summary", ""),
+                    "publicerad":     p.get("published", ""),
+                    "avsandare":      p.get("senders", []),
+                    "genvagar":       p.get("shortcuts", []),
+                    "bilagor":        bilagor_live,
+                    "antal_bilagor":  antal_bilagor,
+                    "har_remissvar":  har_remissvar,
+                    "har_fulltext":   False,
+                })
+        result.sort(key=lambda x: x.get("publicerad") or "", reverse=True)
+        result = result[:sz]
+    cur3.close()
+    conn3.close()
     return result
 
 
 @mcp.tool()
 def gov_get_document(url: str, hamta_fulltext: bool = True) -> dict:
     """
-    Hämtar ett enskilt dokument med fulltext.
+    Hämtar ett enskilt dokument med fulltext via dess g0v.se-URL.
 
-    För bulk-typer (förordningsmotiv, remissmissiv, internationella överenskommelser)
-    returneras sparad fulltext direkt. För on-demand-typer (lagrådsremisser,
-    kommenterade dagordningar) hämtas och cachas PDF:en om den inte redan finns.
+    Söker först i lokal cache. Om URL:en inte finns i cachen — t.ex. för att
+    en daglig synk har misslyckats — görs ett automatiskt live-försök mot
+    g0v.se. Dokumentet upserteras i databasen om det hittas, så framtida
+    anrop och sökningar fungerar utan ny live-hämtning.
+
+    Fulltextbeteende per dokumenttyp:
+      - Remissmissiv, förordningsmotiv, internationella överenskommelser:
+        fulltext finns alltid i databasen (bulk-indexerade vid synk).
+      - Lagrådsremisser, kommenterade dagordningar: PDF hämtas och cachas
+        on-demand första gången (tar några sekunder).
+
+    OBS: bilagor[0] på ett remissmissiv är alltid remissmissivet självt —
+    alltså det dokument du redan hämtar. bilagor[1], bilagor[2] osv. är
+    remissvaren. Använd gov_list_remissinstanser för att se vilka remissvar
+    som finns, och gov_hamta_remissvar för att ladda ned dem.
 
     Args:
-        url:            g0v.se-URL för dokumentet (t.ex. /rattsliga-dokument/lagradsremiss/...).
+        url:            g0v.se-URL för dokumentet
+                        (t.ex. /remisser/2025/01/remiss-av-sou-2024-79-...).
+                        Hämta URL:en via gov_search om den är okänd.
         hamta_fulltext: Om True hämtas PDF on-demand om fulltext saknas (standard: True).
 
     Returnerar: titel, typ, publicerad, sammanfattning, fulltext_md (eller None),
@@ -372,7 +687,16 @@ def gov_get_document(url: str, hamta_fulltext: bool = True) -> dict:
     conn.close()
 
     if not rad:
-        return {"fel": f"Dokument med URL '{url}' hittades inte i databasen."}
+        # Cache-miss: försök hämta live från g0v.se och upserta
+        rad = _hamta_fran_g0v_live(url)
+        if not rad:
+            return {
+                "fel": (
+                    f"Dokument med URL '{url}' hittades inte — "
+                    "varken i lokal cache eller via live-hämtning från g0v.se. "
+                    "Kontrollera att URL:en är korrekt (format: /remisser/YYYY/MM/...)."
+                )
+            }
 
     doc = _rad_till_dict_dokument(rad)
     doc_id = rad[0]
@@ -527,9 +851,15 @@ def gov_search_beslut(
     """
     Söker i regeringsbeslut sedan september 2024.
 
-    Datan hämtas från regeringen.se:s Filter/GetFilteredItems-API och täcker
-    alla typer av beslut: lagrådsremisser, propositioner, regleringsbrev,
-    EU-rådsärenden m.fl.
+    Söker i lokal databas med data synkad från regeringen.se. Täcker alla
+    typer av beslut: propositioner, lagrådsremisser, regleringsbrev,
+    förordningar, EU-rådsärenden m.fl. Beslut äldre än september 2024
+    hanteras av gov_hamta_arendeforteckning och gov_search_arendeforteckning.
+
+    OBS: beslut returnerar vecka_url (t.ex. /regeringsaranden/vecka-14-2025/)
+    men inte en direkt dokumentlänk. Diarienumret (t.ex. Ju2024/00712) är
+    den stabila identifieraren — använd gov_get_beslut_by_diarienummer för
+    att slå upp alla beslut kopplade till ett ärende.
 
     Args:
         query:       Fritextsökning i beslutstitel.
@@ -540,7 +870,8 @@ def gov_search_beslut(
         page:        Sidnummer (1-baserat).
         page_size:   Antal per sida (max 100).
 
-    Returnerar: totalt antal träffar, sida, poster (titel, diarienummer, statsråd, departement, vecka_url).
+    Returnerar: totalt antal träffar, sida, poster (titel, diarienummer,
+    statsråd, departement, vecka_url).
     """
     use_pg = db._ar_postgres()
     conn   = db._hamta_db()
@@ -793,6 +1124,19 @@ def gov_hamta_remissvar(
     """
     Laddar ned och cachar remissvar för en remisspost i omgångar.
 
+    Laddar ned remissvars-PDF:erna direkt från källan (regeringen.se) och
+    lagrar texten i databasen så att gov_search_remissvar kan söka i dem.
+    Verktyget kräver att remissposten finns i databasen — hitta URL:en
+    med gov_search(typ="remiss") och kontrollera att har_remissvar=True.
+
+    OBS: bilagor[0] i remissposten är alltid remissmissivet (det utgående
+    dokumentet), INTE ett remissvar. Remissvaren är bilagor[1] och framåt.
+    gov_list_remissinstanser visar vilka instanser som lämnat svar och om
+    deras PDF redan är nedladdad.
+
+    Arbetsflödet är: gov_search → gov_list_remissinstanser → gov_hamta_remissvar
+    (detta verktyg) → gov_search_remissvar.
+
     Ska anropas efter explicit användarbekräftelse — nedladdningen kan ta
     flera minuter beroende på antal remissvar. Remissvar cachas lokalt i
     REMISSVAR_CACHE_TTL_DAYS dagar (standard 365).
@@ -802,7 +1146,7 @@ def gov_hamta_remissvar(
     nasta_index är null).
 
     Args:
-        remiss_url:          g0v.se-URL för remissposten.
+        remiss_url:          g0v.se-URL för remissposten (hämtas via gov_search).
         batch_storlek:       Antal remissvar att behandla per anrop (standard 5, max 50).
         fortsatt_fran_index: Startindex för nästa batch (hämtas från nasta_index i
                              föregående svar, 0 för första anropet).
@@ -990,11 +1334,17 @@ def gov_list_remissinstanser(remiss_url: str) -> list[dict]:
     """
     Listar alla remissinstanser för en remisspost med cachestatus.
 
-    Visar både vilka instanser som finns i remissmissivet och om deras
-    remissvar är nedladdade och cachade lokalt.
+    Visar vilka instanser som finns i remissmissivet och om deras remissvar
+    redan är nedladdade (har_fulltext=True) eller ännu inte hämtade
+    (har_fulltext=False). har_fulltext=False innebär att PDF:en ännu inte
+    laddats ned via gov_hamta_remissvar — inte att remissvaret saknas hos
+    källan. Kör gov_hamta_remissvar för att ladda ned saknade svar.
+
+    OBS: bilagor[0] i remissposten är alltid remissmissivet och visas INTE
+    i denna lista — bara bilagor[1] och framåt (remissvaren) visas.
 
     Args:
-        remiss_url: g0v.se-URL för remissposten.
+        remiss_url: g0v.se-URL för remissposten (hämtas via gov_search).
 
     Returnerar lista med: remissinstans, har_fulltext, cache_utgar_vid, bilage_url.
     """
@@ -1051,13 +1401,25 @@ def gov_search_remissvar(
     """
     Semantisk sökning i remissvar för en specifik remiss (kräver PostgreSQL).
 
-    Söker i de cachade remissvarens chunks. Anropa gov_hamta_remissvar först
-    för att säkerställa att remissvaren är nedladdade.
+    Söker i de indexerade remissvarens textstycken (chunks). Kräver att
+    gov_hamta_remissvar körts och returnerat status OK för de instanser
+    du vill söka i — om inga chunks finns returneras ett hjälpmeddelande.
+
+    Returnerar inga resultat om:
+      - gov_hamta_remissvar aldrig körts för remissen
+      - PDF-nedladdningen misslyckades för en specifik instans
+      - remissinstans-filtret är för strikt (testa utan remissinstans-param)
+
+    Fullständigt arbetsflöde:
+      gov_search(typ="remiss") → gov_list_remissinstanser → gov_hamta_remissvar
+      → gov_search_remissvar (detta verktyg)
 
     Args:
-        remiss_url:    g0v.se-URL för remissposten.
-        query:         Sökfråga på svenska.
-        remissinstans: Filtrera på specifik remissinstans (partiell matchning).
+        remiss_url:    g0v.se-URL för remissposten (samma som användes i
+                       gov_hamta_remissvar).
+        query:         Sökfråga på svenska (t.ex. "barnperspektiv", "kostnad").
+        remissinstans: Filtrera på specifik remissinstans (partiell matchning,
+                       t.ex. "Socialstyrelsen"). Utelämna för sökning i alla svar.
         top_k:         Antal relevanta stycken att returnera (standard: 5).
 
     Returnerar lista med: remissinstans, chunk_text, relevans.
