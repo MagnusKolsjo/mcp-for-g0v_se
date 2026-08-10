@@ -12,8 +12,9 @@ Täcker lagrådsremisser, remissmissiv, förordningsmotiv, internationella
 | Verktyg | Beskrivning |
 |---|---|
 | `gov_search` | Söker i dokumentmetadata (typ, datum, avsändare, fritextmatch) |
-| `gov_get_document` | Hämtar fulltext för ett specifikt dokument via URL |
-| `gov_search_in_document` | Semantisk sökning i indexerade dokuments chunks |
+| `gov_get_document` | Hämtar fulltext för ett specifikt dokument via URL (`max_tecken`, `fran_tecken`) |
+| `gov_search_in_document` | Semantisk sökning i indexerade dokuments chunks — träffar bär `chunk_index` |
+| `gov_get_chunk` | Hämtar ett textstycke på position, valfritt med omgivande stycken |
 | `gov_list_typer` | Listar tillgängliga dokumenttyper och deras koder |
 | `gov_indexera_bulk` | Indexerar och embeddar dokument i omgångar |
 | `gov_hamta_remissvar` | Laddar ned och cachar remissvar för en remiss |

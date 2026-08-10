@@ -50,6 +50,12 @@ MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio")
 MCP_HOST      = os.getenv("MCP_HOST", "127.0.0.1")
 MCP_PORT      = int(os.getenv("MCP_PORT", "8009"))
 MCP_API_KEY   = os.getenv("MCP_API_KEY", "")
+
+# Standardtak för fulltext i hämtverktygen. Utan ett tak som gäller by default
+# kan ett anrop mot ett stort dokument överskrida MCP-protokollets storleksgräns
+# och misslyckas helt, utan väg runt. Anroparen kan alltid höja taket, eller
+# sätta 0 för hela texten som ett uttryckligt val.
+GOV_MAX_TECKEN = int(os.getenv("GOV_MAX_TECKEN", "60000"))
 REMISSVAR_TTL_DAYS = int(os.getenv("REMISSVAR_CACHE_TTL_DAYS", "365"))
 
 # Vanliga svenska småord som filtreras bort vid tokeniserad FTS-sökning.
@@ -137,7 +143,62 @@ def _ar_svensk(text: str) -> bool:
         return True  # Vid fel — behåll chunken
 
 
-mcp = FastMCP("gov-dokument")
+mcp = FastMCP(
+    "gov-dokument",
+    instructions=(
+        "MCP-server för dokument från Regeringskansliet via g0v.se och regeringen.se: "
+        "lagrådsremisser, remissmissiv, remissvar, förordningsmotiv, internationella "
+        "överenskommelser, kommenterade dagordningar och regeringsbeslut. "
+        "Verktygen har prefixet gov_. "
+        "STORA DOKUMENT: gov_get_document tar max_tecken och fran_tecken. Ett "
+        "förordningsmotiv eller en lagrådsremiss kan vara hundratusentals tecken och "
+        "överskrida svarsgränsen om hela texten begärs. Läs i stället riktat med "
+        "gov_search_in_document, eller på position med gov_get_chunk. "
+        "CITAT: varje sökträff bär sitt chunk_index. Ett ordagrant citat får aldrig "
+        "bygga på ett utdrag markerat som trunkerat — hämta hela stycket med "
+        "gov_get_chunk, och använd kontext=1 när en mening löper över en styckegräns. "
+        "REMISSER: arbetsordningen är gov_search(typ='remiss') → "
+        "gov_list_remissinstanser → gov_hamta_remissvar → gov_search_remissvar. "
+        "Notera att bilagor[0] på ett remissmissiv är missivet självt, inte ett remissvar."
+    ),
+)
+
+
+# ── Textutdrag och trunkering ─────────────────────────────────────────────────
+
+def _skar_ut(text, max_tecken: int, fran_tecken: int = 0) -> dict:
+    """
+    Skär ut ett textutdrag och redovisa alltid vad som kapats.
+
+    Trunkering utan markering är ett tyst datafel — svaret ser ut att vara hela
+    innehållet. Returnerar ett dict-fragment som slås ihop med verktygets svar.
+
+    max_tecken <= 0 betyder ingen trunkering. Klipper på ordgräns.
+    """
+    text   = text or ""
+    totalt = len(text)
+    start  = max(0, min(fran_tecken, totalt))
+    rest   = text[start:]
+
+    if max_tecken and max_tecken > 0 and len(rest) > max_tecken:
+        utdrag    = rest[:max_tecken]
+        brytpunkt = max(utdrag.rfind(" "), utdrag.rfind("\n"))
+        if brytpunkt > max_tecken * 0.6:
+            utdrag = utdrag[:brytpunkt]
+        utdrag    = utdrag.rstrip()
+        trunkerad = True
+    else:
+        utdrag    = rest
+        trunkerad = False
+
+    slut = start + len(utdrag)
+    return {
+        "text":                 utdrag,
+        "tecken_totalt":        totalt,
+        "tecken_visade":        len(utdrag),
+        "trunkerad":            trunkerad,
+        "fortsatt_fran_tecken": slut if slut < totalt else None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -640,7 +701,12 @@ def gov_search(
 
 
 @mcp.tool()
-def gov_get_document(url: str, hamta_fulltext: bool = True) -> dict:
+def gov_get_document(
+    url: str,
+    hamta_fulltext: bool = True,
+    max_tecken: int = GOV_MAX_TECKEN,
+    fran_tecken: int = 0,
+) -> dict:
     """
     Hämtar ett enskilt dokument med fulltext via dess g0v.se-URL.
 
@@ -708,9 +774,8 @@ def gov_get_document(url: str, hamta_fulltext: bool = True) -> dict:
         log.info(f"On-demand PDF-hämtning för: {doc['titel'][:60]}")
         fulltext = _hamta_pdf_vid_behov(doc_id, url, bilagor)
 
-    doc["fulltext_md"] = fulltext
-
-    # Chunka och indexera om fulltext finns och PostgreSQL används
+    # Chunka och indexera om fulltext finns och PostgreSQL används.
+    # Sker på HELA texten — trunkeringen nedan gäller bara svaret till anroparen.
     if fulltext and db._ar_postgres() and doc_id:
         try:
             conn2 = db._hamta_db()
@@ -719,7 +784,116 @@ def gov_get_document(url: str, hamta_fulltext: bool = True) -> dict:
         except Exception as e:
             log.warning(f"Chunkning misslyckades för {url}: {e}")
 
+    utdrag = _skar_ut(fulltext, max_tecken, fran_tecken)
+    doc["fulltext_md"] = utdrag["text"] if fulltext is not None else None
+
+    if fulltext:
+        doc["tecken_totalt"]        = utdrag["tecken_totalt"]
+        doc["tecken_visade"]        = utdrag["tecken_visade"]
+        doc["trunkerad"]            = utdrag["trunkerad"]
+        doc["fortsatt_fran_tecken"] = utdrag["fortsatt_fran_tecken"]
+        if utdrag["trunkerad"]:
+            doc["las_vidare"] = (
+                "Texten är kapad. Läs vidare med fran_tecken="
+                f"{utdrag['fortsatt_fran_tecken']}, sök riktat med "
+                "gov_search_in_document, eller läs på position med gov_get_chunk."
+            )
+
     return doc
+
+
+@mcp.tool()
+def gov_get_chunk(
+    url: str,
+    chunk_index: int,
+    kontext: int = 0,
+    max_tecken: int = 0,
+    fran_tecken: int = 0,
+) -> dict:
+    """
+    Hämtar ett textstycke ur ett dokument på position i stället för på relevans.
+
+    Detta är verktyget för citatgranskning. gov_search_in_document visar var
+    något står; det här hämtar texten där, och kan läsa vidare förbi en träff.
+
+    Args:
+        url:         Dokumentets g0v.se-URL (samma som i gov_get_document).
+        chunk_index: Styckets nummer, ur en träff i gov_search_in_document.
+        kontext:     Ta även med så här många stycken före och efter
+                     (standard 0, max 5). Använd 1 när en mening löper över
+                     en styckegräns.
+        max_tecken:  Teckentak (0 = hela texten).
+        fran_tecken: Börja vid denna teckenposition, för att bläddra vidare.
+
+    Returnerar dokumentets titel, styckets position och texten.
+    Kräver PostgreSQL med pgvector — chunks lagras bara där.
+    """
+    if not db._ar_postgres():
+        return {"fel": "Textstycken lagras bara i PostgreSQL. SQLite stöds inte."}
+
+    kontext = min(max(0, kontext), 5)
+
+    try:
+        conn = db._hamta_db()
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT dc.chunk_index, dc.chunk_text, d.titel,
+                   (SELECT COUNT(*) FROM gov_data.document_chunks x
+                     WHERE x.dokument_id = d.id) AS antal
+            FROM   gov_data.document_chunks dc
+            JOIN   gov_data.dokument d ON d.id = dc.dokument_id
+            WHERE  d.url = %s
+              AND  dc.chunk_index BETWEEN %s AND %s
+            ORDER  BY dc.chunk_index
+        """, (url, chunk_index - kontext, chunk_index + kontext))
+        rader = cur.fetchall()
+
+        if not rader:
+            # Skilj okänt/oindexerat dokument från okänt styckenummer.
+            cur.execute("""
+                SELECT d.titel, (SELECT COUNT(*) FROM gov_data.document_chunks x
+                                  WHERE x.dokument_id = d.id)
+                FROM gov_data.dokument d WHERE d.url = %s
+            """, (url,))
+            meta = cur.fetchone()
+            cur.close(); conn.close()
+
+            if not meta:
+                return {"fel": f"Dokumentet '{url}' finns inte i databasen.", "url": url}
+            if not meta[1]:
+                return {
+                    "fel": (
+                        "Dokumentet finns men har inga indexerade textstycken. "
+                        "Anropa gov_get_document(url) först — den chunkar och "
+                        "indexerar dokumentet."
+                    ),
+                    "url": url, "titel": meta[0],
+                }
+            return {
+                "fel": (
+                    f"Dokumentet har inget textstycke med chunk_index {chunk_index}. "
+                    f"Det har {meta[1]} stycken (numrerade från 0)."
+                ),
+                "url": url, "titel": meta[0], "antal_stycken": meta[1],
+            }
+
+        cur.close(); conn.close()
+    except Exception as exc:
+        log.error(f"gov_get_chunk misslyckades ({url}): {exc}")
+        return {"fel": str(exc), "url": url}
+
+    text   = "\n\n".join(r[1] or "" for r in rader)
+    utdrag = _skar_ut(text, max_tecken, fran_tecken)
+
+    return {
+        "url":           url,
+        "titel":         rader[0][2],
+        "chunk_index":   chunk_index,
+        "chunk_fran":    rader[0][0],
+        "chunk_till":    rader[-1][0],
+        "antal_stycken": rader[0][3],
+        **utdrag,
+    }
 
 
 @mcp.tool()
@@ -748,7 +922,8 @@ def gov_search_in_document(url: str, query: str, top_k: int = 5) -> list[dict]:
 
     cur.execute("""
         SELECT dc.chunk_text,
-               1 - (dc.embedding <=> %s::vector) AS relevans
+               1 - (dc.embedding <=> %s::vector) AS relevans,
+               dc.chunk_index
         FROM gov_data.document_chunks dc
         JOIN gov_data.dokument d ON d.id = dc.dokument_id
         WHERE d.url = %s
@@ -756,8 +931,10 @@ def gov_search_in_document(url: str, query: str, top_k: int = 5) -> list[dict]:
         LIMIT %s
     """, (fraga_vektor, url, fraga_vektor, top_k))
 
+    # chunk_index exponeras så att en träff kan hämtas tillbaka med omgivning
+    # via gov_get_chunk — utan det går kedjningen från sökning till citat inte.
     result = [
-        {"chunk_text": r[0], "relevans": round(float(r[1]), 4)}
+        {"chunk_text": r[0], "relevans": round(float(r[1]), 4), "chunk_index": r[2]}
         for r in cur.fetchall()
     ]
 

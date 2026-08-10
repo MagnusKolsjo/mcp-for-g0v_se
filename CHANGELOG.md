@@ -4,6 +4,45 @@ Alla viktiga ändringar i detta projekt dokumenteras här.
 Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 
+## [3.2.0] — 2026-08-10
+
+### Tillagt
+
+- **`gov_get_chunk(url, chunk_index, kontext, max_tecken, fran_tecken)`** — hämtar ett
+  textstycke på position i stället för på sökrelevans. Dokumentets text gick tidigare
+  bara att nå via semantisk sökning eller som helhet; en passage som inte matchade
+  någon fråga var därmed oåtkomlig, och ett citat kunde inte kontrolleras mot sin
+  omgivning. Felmeddelandet skiljer okänt dokument, oindexerat dokument och okänt
+  styckenummer åt.
+- **`max_tecken` och `fran_tecken`** i `gov_get_document`. Kapade svar bär `trunkerad`,
+  `tecken_totalt`, `tecken_visade`, `fortsatt_fran_tecken` och `las_vidare`.
+- **`chunk_index` i träffarna från `gov_search_in_document`** — utan det gick det inte
+  att kedja från en sökträff till stycket den kom ur.
+- **`instructions`-sträng på servern** — storleksregel, citatregel och remissarbetsflödet.
+
+### Fixat
+
+- **`gov_get_document` kunde överskrida MCP:s storleksgräns utan väg runt.** Verktyget
+  returnerade hela `fulltext_md` utan möjlighet att begränsa. Mätt mot databasen:
+  **8 av 7 147 dokument med fulltext är över 1 000 000 tecken** — det största är
+  1 858 641 tecken (konventionen om meddelande av europeiska patent), alltså nära
+  dubbla gränsen. För dem misslyckades anropet alltid, oavsett hur det formulerades.
+  Ytterligare 51 dokument ligger över 500 000 tecken och var i riskzonen.
+
+  Chunkningen och indexeringen sker fortfarande på hela texten — trunkeringen gäller
+  bara svaret till anroparen.
+
+### Bakgrund
+
+Genomför projektets svarskontrakt (`00-las-forst.md` → "Svarskontraktet — storlek,
+trunkering, adressering och sökning"). Inga schemaändringar; `chunk_index` fanns redan
+i `gov_data.document_chunks` men exponerades inte.
+
+**OBS vid uppgradering:** `gov_get_chunk` är ett nytt verktyg i en befintlig server och
+kan kräva nytt servernamn i klientkonfigurationen för att synas.
+
+---
+
 ## [3.1.0] — 2026-05-23
 
 ### Tillagt
