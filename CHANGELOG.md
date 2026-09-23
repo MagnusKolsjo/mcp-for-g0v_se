@@ -63,6 +63,16 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
   Omdirigeringen sker nu under `_TYST_FD_LOCK`, som serialiserar de
   bullriga anropen — FD 1/2 är processvida, så det fanns ingen säker
   parallellism att bevara.
+- **SSRF i `gov_hamta_arendeforteckning`.** En `vecka_url` som inte
+  började med `/` hämtades som den var, utan värdkontroll — i http-läget
+  kunde en godtycklig `https://`/`http://`-adress (intern eller extern)
+  därmed hämtas av servern. `_hamta_arendeforteckning_url` kräver nu att
+  en absolut `vecka_url` redan pekar på en tillåten värd
+  (`www.regeringen.se`), och `_hamta_sakert` kontrollerar schema och värd
+  på både sidhämtningen och varje PDF-nedladdning, med manuell,
+  värdkontrollerad omdirigeringsföljning (max 5 steg — ingen automatisk
+  följning till en annan värd). Båda hämtningarna använder nu projektets
+  egen User-Agent, som tidigare saknades helt för dessa två anrop.
 
 ### Brytande ändringar
 

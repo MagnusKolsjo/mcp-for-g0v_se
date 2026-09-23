@@ -33,6 +33,7 @@ from pathlib import Path
 import re
 import time
 import logging
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Any, NotRequired, Optional, TypedDict
 
@@ -1936,7 +1937,71 @@ def _konfigurera_logging():
 
 # ---------------------------------------------------------------------------
 # Verktyg — ärendeförteckningar (beslut pre-sept 2024)
+#
+# vecka_url tas emot som en relativ URL i normalfallet, men koden har
+# historiskt accepterat en absolut URL rakt av (se _hamta_arendeforteckning_url).
+# I http-läget är gov_hamta_arendeforteckning nåbar för vem som helst med
+# rätt API-nyckel — utan en värdkontroll skulle en absolut vecka_url, eller
+# en omdirigering i svaret, kunna få servern att hämta en godtycklig
+# intern eller extern adress (SSRF). _hamta_sakert löser det: schema och
+# värd valideras före varje hämtning, och omdirigeringar följs bara ett
+# steg i taget så länge målet är kvar på samma tillåtna värd.
 # ---------------------------------------------------------------------------
+
+_AF_TILLATNA_VARDAR = {"www.regeringen.se"}
+_AF_SESSION = _requests.Session()
+_AF_SESSION.headers.update({
+    "User-Agent": _G0V_SESSION.headers["User-Agent"],
+})
+
+
+def _hamta_arendeforteckning_url(vecka_url: str) -> str:
+    """Bygger den fulla URL:en för en veckas ärendeförteckningssida.
+
+    En relativ vecka_url (normalfallet, börjar med "/") slås alltid ihop
+    med BASE_URL och är därmed alltid regeringen.se. En absolut vecka_url
+    accepteras bara om den redan pekar på en tillåten värd — annars
+    kastas ToolError direkt, innan något nätverksanrop görs.
+    """
+    if vecka_url.startswith("/"):
+        return "https://www.regeringen.se" + vecka_url
+    parsed = urllib.parse.urlsplit(vecka_url)
+    if parsed.scheme != "https" or parsed.netloc not in _AF_TILLATNA_VARDAR:
+        raise ToolError(
+            f"Otillåten vecka_url: {vecka_url!r}. Ange en relativ sökväg "
+            "(/arendeforteckningar/...) eller en fullständig "
+            "https://www.regeringen.se/-adress."
+        )
+    return vecka_url
+
+
+def _hamta_sakert(url: str, *, timeout: int, vad: str):
+    """Hämtar en URL på en av _AF_TILLATNA_VARDAR, med manuell,
+    värdkontrollerad omdirigeringsföljning (max 5 steg) — så att varken en
+    komprometterad sida eller en oväntad omdirigering kan få servern att
+    hämta något utanför de tillåtna värdarna. Använder projektets egen
+    User-Agent, aldrig en webbläsarlik.
+    """
+    aktuell = url
+    for _ in range(5):
+        parsed = urllib.parse.urlsplit(aktuell)
+        if parsed.scheme != "https" or parsed.netloc not in _AF_TILLATNA_VARDAR:
+            vardar = ", ".join(f"https://{v}/" for v in sorted(_AF_TILLATNA_VARDAR))
+            raise ToolError(
+                f"Otillåten adress vid hämtning av {vad}: {aktuell!r}. "
+                f"Endast {vardar} tillåts."
+            )
+        svar = _AF_SESSION.get(aktuell, timeout=timeout, allow_redirects=False)
+        if svar.status_code in (301, 302, 303, 307, 308):
+            plats = svar.headers.get("Location")
+            if not plats:
+                raise ToolError(f"Omdirigering utan Location vid hämtning av {vad}.")
+            aktuell = urllib.parse.urljoin(aktuell, plats)
+            continue
+        svar.raise_for_status()
+        return svar
+    raise ToolError(f"För många omdirigeringar vid hämtning av {vad}.")
+
 
 @mcp.tool(title="Hämta ärendeförteckning", annotations=SYNK)
 @_fel_som_toolerror
@@ -1963,21 +2028,22 @@ def gov_hamta_arendeforteckning(
     if not db._ar_postgres():
         raise ToolError("Ärendeförteckningar kräver PostgreSQL med pgvector.")
 
-    import requests
     from bs4 import BeautifulSoup
 
     BASE_URL = "https://www.regeringen.se"
-    full_url = BASE_URL + vecka_url if vecka_url.startswith("/") else vecka_url
+    full_url = _hamta_arendeforteckning_url(vecka_url)
 
     # Parsa vecka och år ur URL — oberoende av om PDF-länkar hittas nedan.
     vecka_match = re.search(r"vecka[_-](\d+)[_-](\d{4})", vecka_url)
     vecka_nummer = int(vecka_match.group(1)) if vecka_match else None
     vecka_ar     = int(vecka_match.group(2)) if vecka_match else None
 
-    # Hämta veckosidan och extrahera PDF-länkar
+    # Hämta veckosidan och extrahera PDF-länkar. _hamta_sakert kontrollerar
+    # schema och värd på både full_url och varje omdirigering.
     try:
-        resp = requests.get(full_url, timeout=30)
-        resp.raise_for_status()
+        resp = _hamta_sakert(full_url, timeout=30, vad="veckosidan")
+    except ToolError:
+        raise
     except Exception as e:
         raise ToolError(f"Kunde inte hämta veckosidan: {e}") from e
 
@@ -2032,8 +2098,7 @@ def gov_hamta_arendeforteckning(
 
         try:
             if not os.path.exists(pdf_sokvag):
-                pdf_resp = requests.get(pdf_url, timeout=60)
-                pdf_resp.raise_for_status()
+                pdf_resp = _hamta_sakert(pdf_url, timeout=60, vad=f"PDF ({dept_namn})")
                 with open(pdf_sokvag, "wb") as f:
                     f.write(pdf_resp.content)
         except Exception as e:
