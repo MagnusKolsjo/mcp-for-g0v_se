@@ -57,6 +57,12 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
   fortsätter (`year_to` satt till året för sista medtagna posten,
   eftersom träffarna redan är sorterade fallande på publiceringsdatum).
   `sz` och övriga parametrar betyder fortfarande exakt vad de gjorde.
+- **`pdf_lib._tysta_subprocess_stdout` saknade lås kring FD 1/2-omdirigeringen.**
+  Två samtidiga textextraktioner kunde återställa filbeskrivarna i fel
+  ordning och permanent koppla bort MCP-stdio-protokollet från JSON-RPC.
+  Omdirigeringen sker nu under `_TYST_FD_LOCK`, som serialiserar de
+  bullriga anropen — FD 1/2 är processvida, så det fanns ingen säker
+  parallellism att bevara.
 
 ### Brytande ändringar
 

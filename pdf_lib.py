@@ -4,6 +4,7 @@ Importeras av 02_initial_bulk.py, 03_synka_data.py och mcp_server.py.
 """
 import os
 import json
+import threading
 import time
 import logging
 from datetime import datetime, timedelta, timezone
@@ -45,6 +46,14 @@ REGERINGEN_BAS  = "https://www.regeringen.se"
 
 import contextlib
 
+# FD 1 och FD 2 är processvida — två samtidiga extraktioner som redirigerar
+# dem samtidigt kan återställa i fel ordning (den ena trådens `finally`
+# lägger tillbaka den andra trådens sparade FD, eller tvärtom), vilket
+# permanent kan koppla bort JSON-RPC-stdout från MCP-klienten. Eftersom
+# resursen i sig är processvid finns ingen säker parallellism att vinna —
+# låset serialiserar helt enkelt de bullriga anropen.
+_TYST_FD_LOCK = threading.Lock()
+
 
 @contextlib.contextmanager
 def _tysta_subprocess_stdout():
@@ -61,24 +70,26 @@ def _tysta_subprocess_stdout():
     till loggfilen under det bullriga anropet, och återställs efteråt.
     Python:s sys.stdout/sys.stderr berörs inte (för MCP-protokollet
     behåller dem så att JSON-RPC-svar fortsätter fungera utanför
-    contextmanagern).
+    contextmanagern). Hela om- och återställningen sker under
+    _TYST_FD_LOCK, eftersom FD 1/2 delas av alla trådar i processen.
     """
     log_path = _SCRIPT_DIR / "logs" / "subprocess.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    save_out = os.dup(1)
-    save_err = os.dup(2)
-    log_fd   = os.open(str(log_path), os.O_WRONLY | os.O_APPEND | os.O_CREAT)
-    try:
-        os.dup2(log_fd, 1)
-        os.dup2(log_fd, 2)
-        yield
-    finally:
-        os.dup2(save_out, 1)
-        os.dup2(save_err, 2)
-        os.close(save_out)
-        os.close(save_err)
-        os.close(log_fd)
+    with _TYST_FD_LOCK:
+        save_out = os.dup(1)
+        save_err = os.dup(2)
+        log_fd   = os.open(str(log_path), os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+        try:
+            os.dup2(log_fd, 1)
+            os.dup2(log_fd, 2)
+            yield
+        finally:
+            os.dup2(save_out, 1)
+            os.dup2(save_err, 2)
+            os.close(save_out)
+            os.close(save_err)
+            os.close(log_fd)
 
 
 # Dokumenttyper som ska bulk-laddas ned
