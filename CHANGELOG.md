@@ -44,6 +44,11 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
   README, i linje med att `pdf_lib.ocr_pdf` redan importerade det lat.
   Servern startar och behandlar de allra flesta dokument utan paketet;
   det behövs bara för bildbaserade PDF:er utan textlager.
+- **Databasfel gav tidigare bara "Error executing tool X" utan orsak.**
+  Alla tretton verktyg är nu dekorerade med `_fel_som_toolerror`, som
+  fångar ett oväntat undantag (databasen är nere, en fråga misslyckas),
+  loggar den faktiska orsaken och kastar `ToolError` med den i
+  meddelandet i stället för att låta undantaget bubbla obehandlat.
 
 ### Brytande ändringar
 

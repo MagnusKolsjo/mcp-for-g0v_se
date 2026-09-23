@@ -27,6 +27,7 @@ Transport styrs via MCP_TRANSPORT i .env: stdio (standard) eller http, via mcp_t
 """
 import os
 import json
+import functools
 import threading
 from pathlib import Path
 import re
@@ -564,7 +565,30 @@ def _hamta_pdf_vid_behov(doc_id: int, doc_url: str, bilagor) -> Optional[str]:
 # Verktyg
 # ---------------------------------------------------------------------------
 
+def _fel_som_toolerror(fn):
+    """Dekorator: fångar ett oväntat undantag i ett verktyg — vanligast en
+    databas som inte går att nå eller en fråga som misslyckas — och kastar
+    det vidare som ToolError med orsaken i meddelandet.
+
+    Utan detta ger ett obehandlat undantag bara "Error executing tool X"
+    till klienten, utan orsak (se migreringsguidens avsnitt om fel). Den
+    faktiska detaljen loggas alltid, så att den inte försvinner även när
+    ToolError-meddelandet förkortas eller filtreras av klienten.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except ToolError:
+            raise
+        except Exception as exc:
+            log.error("%s misslyckades: %s", fn.__name__, exc, exc_info=True)
+            raise ToolError(f"{fn.__name__} misslyckades: databasfel ({exc}).") from exc
+    return wrapper
+
+
 @mcp.tool(title="Lista dokumenttyper", annotations=LASNING_DB)
+@_fel_som_toolerror
 def gov_list_typer() -> list[TypInfo]:
     """
     Listar tillgängliga dokumenttyper med antal dokument och indexeringsstatus.
@@ -607,6 +631,7 @@ def gov_list_typer() -> list[TypInfo]:
 
 
 @mcp.tool(title="Sök i regeringsdokument", annotations=LASNING_EXTERN)
+@_fel_som_toolerror
 def gov_search(
     query: str = "",
     typ: str = "",
@@ -868,6 +893,7 @@ def gov_search(
 
 
 @mcp.tool(title="Hämta dokument", annotations=LASNING_EXTERN)
+@_fel_som_toolerror
 def gov_get_document(
     url: str,
     hamta_fulltext: bool = True,
@@ -968,6 +994,7 @@ def gov_get_document(
 
 
 @mcp.tool(title="Hämta textstycke på position", annotations=LASNING_DB)
+@_fel_som_toolerror
 def gov_get_chunk(
     url: str,
     chunk_index: int,
@@ -1058,6 +1085,7 @@ def gov_get_chunk(
 
 
 @mcp.tool(title="Sök semantiskt i ett dokument", annotations=LASNING_DB)
+@_fel_som_toolerror
 def gov_search_in_document(url: str, query: str, top_k: int = 5) -> list[ChunkTraff]:
     """
     Semantisk sökning inom ett enskilt dokument (kräver PostgreSQL med pgvector).
@@ -1108,6 +1136,7 @@ def gov_search_in_document(url: str, query: str, top_k: int = 5) -> list[ChunkTr
 
 
 @mcp.tool(title="Indexera dokument i bulk", annotations=SYNK)
+@_fel_som_toolerror
 def gov_indexera_bulk(
     batch_storlek: int = 10,
     fortsatt_fran_index: int = 0,
@@ -1176,6 +1205,7 @@ def gov_indexera_bulk(
 
 
 @mcp.tool(title="Sök i regeringsbeslut", annotations=LASNING_DB)
+@_fel_som_toolerror
 def gov_search_beslut(
     query: str = "",
     from_date: str = "",
@@ -1297,6 +1327,7 @@ def gov_search_beslut(
 
 
 @mcp.tool(title="Hämta beslut på diarienummer", annotations=LASNING_DB)
+@_fel_som_toolerror
 def gov_get_beslut_by_diarienummer(diarienummer: str) -> list[BeslutPost]:
     """
     Hämtar alla regeringsbeslut kopplade till ett specifikt diarienummer.
@@ -1453,6 +1484,7 @@ def _chunka_och_indexera_dokument(dokument_id: int, fulltext: str, conn) -> int:
 # ---------------------------------------------------------------------------
 
 @mcp.tool(title="Hämta remissvar", annotations=SYNK)
+@_fel_som_toolerror
 def gov_hamta_remissvar(
     remiss_url: str,
     batch_storlek: int = 5,
@@ -1667,6 +1699,7 @@ def gov_hamta_remissvar(
 
 
 @mcp.tool(title="Lista remissinstanser", annotations=LASNING_DB)
+@_fel_som_toolerror
 def gov_list_remissinstanser(remiss_url: str) -> list[RemissinstansStatus]:
     """
     Listar alla remissinstanser för en remisspost med cachestatus.
@@ -1729,6 +1762,7 @@ def gov_list_remissinstanser(remiss_url: str) -> list[RemissinstansStatus]:
 
 
 @mcp.tool(title="Sök semantiskt i remissvar", annotations=LASNING_DB)
+@_fel_som_toolerror
 def gov_search_remissvar(
     remiss_url: str,
     query: str,
@@ -1853,6 +1887,7 @@ def _konfigurera_logging():
 # ---------------------------------------------------------------------------
 
 @mcp.tool(title="Hämta ärendeförteckning", annotations=SYNK)
+@_fel_som_toolerror
 def gov_hamta_arendeforteckning(
     vecka_url: str,
     departement: str = "",
@@ -2025,6 +2060,7 @@ def gov_hamta_arendeforteckning(
 
 
 @mcp.tool(title="Sök semantiskt i ärendeförteckningar", annotations=LASNING_DB)
+@_fel_som_toolerror
 def gov_search_arendeforteckning(
     query: str,
     from_date: str = "",
