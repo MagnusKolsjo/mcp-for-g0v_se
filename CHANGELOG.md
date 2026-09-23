@@ -4,6 +4,57 @@ Alla viktiga ändringar i detta projekt dokumenteras här.
 Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Ändrat
+
+- **Migrerad till `mcp>=2.0,<3`.** Servern byggs nu på `MCPServer` från
+  `mcp.server.mcpserver` i stället för `FastMCP`. Transportvalet (stdio/http)
+  sköts av en egen kopia av `mcp_transport.py`, som ersätter den tidigare
+  handskrivna http-uppstarten (`mcp.get_asgi_app()`, som inte längre finns
+  i 2.x och gjorde http-läget trasigt). `version="3.2.0"` sätts explicit
+  (annars rapporteras tom sträng till klienten) och läses av från denna
+  ändringslogg. `cache_hints` satta enligt `mcp_annotationer.py`.
+- **Alla tretton verktyg har fått `title=` och `annotations=`.** Läsande
+  verktyg mot enbart lokal databas är klassade `LASNING_DB`; `gov_search`
+  och `gov_get_document` (som kan göra live-hämtning mot g0v.se) är
+  klassade `LASNING_EXTERN`. De tre verktyg som skriver eller indexerar på
+  begäran — `gov_indexera_bulk`, `gov_hamta_remissvar` och
+  `gov_hamta_arendeforteckning` — är klassade `SYNK`.
+- **Typade returvärden** (`TypedDict`) på samtliga verktyg, så att
+  `outputSchema` genereras. Fält som saknas i äldre g0v.se-poster
+  (`sammanfattning`, `publicerad`, `statsrad` m.fl.) är typade som
+  valfria eller nullbara, enligt migreringsguidens varning om att en
+  felaktig typ på ett fält gör att hela anropet misslyckas.
+- **`ToolError` vid förväntade fel** i stället för `{"fel": ...}`-dictar:
+  okänd URL, okänt diarienummer, semantisk sökning utan PostgreSQL,
+  inaktiverade ärendeförteckningar, misslyckad hämtning av veckosidan.
+  `gov_hamta_arendeforteckning` utan träffade PDF-länkar räknas inte som
+  fel — verktyget returnerar nu ett normalt (tomt) resultat i stället för
+  ett `info`-fält, för att hålla svarsformen enhetlig.
+- **Dubbelkontrollerad låsning** kring den lata inläsningen av
+  embeddingmodellen och språkdetektorn (`_hamta_modell`, `_hamta_detektor`).
+  Synkrona verktyg körs på arbetstrådar i mcp 2.x, så flera samtidiga
+  anrop kunde tidigare trigga parallell inläsning av samma modell.
+- `requirements.txt`: `mcp>=2.0,<3`.
+
+### Rättat
+
+- **`ocrmypdf` är nu dokumenterat som valfritt** i `requirements.txt` och
+  README, i linje med att `pdf_lib.ocr_pdf` redan importerade det lat.
+  Servern startar och behandlar de allra flesta dokument utan paketet;
+  det behövs bara för bildbaserade PDF:er utan textlager.
+
+### Brytande ändringar
+
+- Ingen brytande ändring i verktygens namn, parametrar eller normala
+  svarsform. `{"fel": ...}`-svar har ersatts av `ToolError` (`isError`) —
+  en klient som läste `fel`-nyckeln i `structuredContent` måste läsa
+  felmeddelandet från protokollets felkanal i stället.
+- http-läget krävde redan `MCP_API_KEY` (fail-closed) före migreringen;
+  det kravet är oförändrat, bara omflyttat till den delade
+  `mcp_transport.py`.
+
 ## [3.2.0] — 2026-08-10
 
 ### Tillagt

@@ -1,10 +1,11 @@
 """
 mcp_server.py — MCP-server för regeringsdokument och regeringsbeslut.
 
-Tolv verktyg:
+Tretton verktyg:
   gov_list_typer               — Lista dokumenttyper med antal poster
   gov_search                   — Sök i metadata (lokal cache + valfri live-sökning mot g0v.se)
   gov_get_document             — Hämta ett dokument (live-fallback om URL saknas i cache)
+  gov_get_chunk                — Hämta ett textstycke på position (kräver PostgreSQL)
   gov_search_in_document       — Semantisk sökning inom ett dokument (kräver PostgreSQL)
   gov_indexera_bulk            — Bulk-chunkning och embedding för redan nedladdade dokument
   gov_hamta_arendeforteckning  — Hämtar och indexerar ärendeförtecknings-PDF:er on-demand (pre-sept 2024)
@@ -22,22 +23,26 @@ Live-fallback: gov_get_document gör automatiskt live-hämtning mot g0v.se om UR
 saknas i lokal cache (t.ex. vid misslyckad daglig synk). gov_search(sok_live=True)
 söker live om inga träffar finns i databasen. Hittade dokument upserteras i DB.
 
-Transport styrs via MCP_TRANSPORT i .env: stdio (standard) eller http.
+Transport styrs via MCP_TRANSPORT i .env: stdio (standard) eller http, via mcp_transport.starta.
 """
 import os
 import json
+import threading
 from pathlib import Path
 import re
 import time
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, NotRequired, Optional, TypedDict
 
 import requests as _requests
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from hamta_listor_lib import upsert_dokument
+from mcp_annotationer import CACHE_HINTAR, LASNING_DB, LASNING_EXTERN, SYNK
+from mcp_transport import starta
 import db
 
 load_dotenv()
@@ -46,10 +51,9 @@ log = logging.getLogger(__name__)
 
 _SCRIPT_DIR   = Path(__file__).parent
 
+# Bara transportslaget läses här, för att styra loggningen (se
+# _konfigurera_logging). Host, port och API-nyckel läses av mcp_transport.py.
 MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio")
-MCP_HOST      = os.getenv("MCP_HOST", "127.0.0.1")
-MCP_PORT      = int(os.getenv("MCP_PORT", "8009"))
-MCP_API_KEY   = os.getenv("MCP_API_KEY", "")
 
 # Standardtak för fulltext i hämtverktygen. Utan ett tak som gäller by default
 # kan ett anrop mot ett stort dokument överskrida MCP-protokollets storleksgräns
@@ -88,40 +92,51 @@ ON_DEMAND_TYPER = set(os.getenv("ON_DEMAND_TYPER", "2085,2098").split(","))
 ARENDEFORTECKNING_AKTIV       = os.getenv("ARENDEFORTECKNING_AKTIV", "true").lower() == "true"
 ARENDEFORTECKNING_CACHE_TTL   = int(os.getenv("ARENDEFORTECKNING_CACHE_TTL_DAYS", "0"))
 
-# Lazy-laddad embeddingmodell
-_modell   = None
-_detektor = None
+# Lazy-laddad embeddingmodell och språkdetektor. Synkrona verktyg körs på
+# arbetstrådar i mcp 2.x — flera anrop kan nå den här kontrollen samtidigt
+# innan objektet finns, så inläsningen skyddas med dubbelkontrollerad
+# låsning: kontrollera utan lås, ta låset bara vid faktisk inläsning,
+# kontrollera igen innanför låset.
+_modell        = None
+_modell_lock   = threading.Lock()
+_detektor: object | None = None
+_detektor_lock = threading.Lock()
 
 def _hamta_modell():
     global _modell
     if _modell is None:
-        from sentence_transformers import SentenceTransformer
-        modell_namn = os.getenv("EMBEDDING_MODEL", "KBLab/sentence-bert-swedish-cased")
-        log.info(f"Laddar embeddingmodell: {modell_namn}")
-        _modell = SentenceTransformer(modell_namn)
+        with _modell_lock:
+            if _modell is None:
+                from sentence_transformers import SentenceTransformer
+                modell_namn = os.getenv("EMBEDDING_MODEL", "KBLab/sentence-bert-swedish-cased")
+                log.info(f"Laddar embeddingmodell: {modell_namn}")
+                _modell = SentenceTransformer(modell_namn)
     return _modell
 
 
 def _hamta_detektor():
-    """Lazy-laddad lingua-språkdetektor. Returnerar None om lingua saknas."""
+    """Lazy-laddad lingua-språkdetektor. Returnerar False om lingua saknas."""
     global _detektor
     if _detektor is not None:
         return _detektor
-    try:
-        from lingua import Language, LanguageDetectorBuilder
-        _detektor = LanguageDetectorBuilder.from_languages(
-            Language.SWEDISH,
-            Language.ENGLISH,
-            Language.FRENCH,
-            Language.GERMAN,
-            Language.BOKMAL,
-            Language.NYNORSK,
-            Language.DANISH,
-        ).build()
-        log.info("Lingua-språkdetektor laddad")
-    except ImportError:
-        log.warning("lingua-language-detector ej installerat — språkfiltrering inaktiv")
-        _detektor = False  # Markör: försökt men saknas
+    with _detektor_lock:
+        if _detektor is not None:
+            return _detektor
+        try:
+            from lingua import Language, LanguageDetectorBuilder
+            _detektor = LanguageDetectorBuilder.from_languages(
+                Language.SWEDISH,
+                Language.ENGLISH,
+                Language.FRENCH,
+                Language.GERMAN,
+                Language.BOKMAL,
+                Language.NYNORSK,
+                Language.DANISH,
+            ).build()
+            log.info("Lingua-språkdetektor laddad")
+        except ImportError:
+            log.warning("lingua-language-detector ej installerat — språkfiltrering inaktiv")
+            _detektor = False  # Markör: försökt men saknas
     return _detektor
 
 
@@ -143,8 +158,10 @@ def _ar_svensk(text: str) -> bool:
         return True  # Vid fel — behåll chunken
 
 
-mcp = FastMCP(
+mcp = MCPServer(
     "gov-dokument",
+    version="3.2.0",
+    cache_hints=CACHE_HINTAR,
     instructions=(
         "MCP-server för dokument från Regeringskansliet via g0v.se och regeringen.se: "
         "lagrådsremisser, remissmissiv, remissvar, förordningsmotiv, internationella "
@@ -162,6 +179,159 @@ mcp = FastMCP(
         "Notera att bilagor[0] på ett remissmissiv är missivet självt, inte ett remissvar."
     ),
 )
+
+
+# ── Typade returvärden ─────────────────────────────────────────────────────
+#
+# g0v.se-data har historiskt förekommande null-fält (sammanfattning,
+# publicerad, avsandare m.fl. kan saknas för äldre poster). Sådana fält är
+# typade som `X | None` eller `NotRequired[...]` i stället för att antas
+# finnas, enligt migreringsguidens varning om att en felaktig typ på ett
+# fält gör att hela anropet misslyckas.
+
+class Utdrag(TypedDict):
+    """Textutdrag med trunkeringsstatus — bäddas in i flera svar."""
+    text:                 str
+    tecken_totalt:        int
+    tecken_visade:        int
+    trunkerad:            bool
+    fortsatt_fran_tecken: int | None
+
+
+class TypInfo(TypedDict):
+    """En dokumenttyp med antal och indexeringsstrategi (gov_list_typer)."""
+    typ:                 str
+    typ_kod:              str
+    antal:                int
+    antal_med_fulltext:   int
+    indexeringsstrategi:  str
+
+
+class Dokument(TypedDict):
+    """Ett regeringsdokument, med eller utan fulltext (gov_search, gov_get_document)."""
+    url:              str
+    typ:              str
+    typ_kod:          str
+    titel:            str | None
+    sammanfattning:   str | None
+    publicerad:       str | None
+    avsandare:        list[str] | str | None
+    genvagar:         list[Any]
+    bilagor:          list[Any]
+    antal_bilagor:    int
+    har_remissvar:    bool
+    har_fulltext:     bool
+    fulltext_md:              NotRequired[str | None]
+    tecken_totalt:            NotRequired[int]
+    tecken_visade:             NotRequired[int]
+    trunkerad:                 NotRequired[bool]
+    fortsatt_fran_tecken:      NotRequired[int | None]
+    las_vidare:                NotRequired[str]
+
+
+class ChunkSvar(TypedDict):
+    """Ett textstycke ur ett dokument, på position (gov_get_chunk)."""
+    url:           str
+    titel:         str | None
+    chunk_index:   int
+    chunk_fran:    int
+    chunk_till:    int
+    antal_stycken: int
+    text:                 str
+    tecken_totalt:        int
+    tecken_visade:        int
+    trunkerad:            bool
+    fortsatt_fran_tecken: int | None
+
+
+class ChunkTraff(TypedDict):
+    """Semantisk träff i ett dokument (gov_search_in_document) — eller ett
+    hjälpmeddelande när inga chunks finns ännu."""
+    chunk_text:   NotRequired[str]
+    relevans:     NotRequired[float]
+    chunk_index:  NotRequired[int]
+    info:         NotRequired[str]
+
+
+class BulkIndexResultat(TypedDict):
+    """Resultat av en batch-chunkning (gov_indexera_bulk)."""
+    totalt_kvar:        int
+    detta_batch:        int
+    indexerade_chunks:  int
+    nasta_index:        int | None
+
+
+class BeslutPost(TypedDict):
+    """Ett regeringsbeslut (gov_search_beslut, gov_get_beslut_by_diarienummer)."""
+    titel:                  str | None
+    regeringsarendenummer:  str | None
+    diarienummer:           str | None
+    statsrad:               str | None
+    departement:            str | None
+    vecka_url:              str | None
+
+
+class BeslutResultat(TypedDict):
+    """Sida med regeringsbeslut (gov_search_beslut)."""
+    totalt:    int
+    sida:      int
+    per_sida:  int
+    poster:    list[BeslutPost]
+
+
+class RemissvarPost(TypedDict):
+    """Status för ett enskilt remissvar under nedladdning (gov_hamta_remissvar)."""
+    remissinstans:  str
+    status:         str
+    antal_tecken:   NotRequired[int]
+
+
+class RemissvarResultat(TypedDict):
+    """Resultat av en batch remissvarsnedladdning (gov_hamta_remissvar)."""
+    totalt_antal:  NotRequired[int]
+    detta_batch:   NotRequired[int]
+    indexerade:    NotRequired[int]
+    nasta_index:   NotRequired[int | None]
+    remissvar:     NotRequired[list[RemissvarPost]]
+    info:          NotRequired[str]
+    antal:         NotRequired[int]
+
+
+class RemissinstansStatus(TypedDict):
+    """En remissinstans med cachestatus (gov_list_remissinstanser)."""
+    remissinstans:     str
+    bilage_url:        str
+    har_fulltext:      bool
+    cache_utgar_vid:   str | None
+
+
+class RemissvarTraff(TypedDict):
+    """Semantisk träff i remissvar (gov_search_remissvar) — eller ett
+    hjälpmeddelande när inga chunks finns ännu."""
+    remissinstans:  NotRequired[str]
+    chunk_text:     NotRequired[str]
+    relevans:       NotRequired[float]
+    info:           NotRequired[str]
+
+
+class ArendeforteckningResultat(TypedDict):
+    """Resultat av en ärendeförtecknings-hämtning (gov_hamta_arendeforteckning)."""
+    nya_pdf:        int
+    totalt_chunks:  int
+    departement:    list[str]
+    vecka_nummer:   int | None
+    vecka_ar:       int | None
+
+
+class ArendeforteckningTraff(TypedDict):
+    """Semantisk träff i ärendeförteckningar (gov_search_arendeforteckning) —
+    eller ett hjälpmeddelande när inga är indexerade."""
+    chunk_text:    NotRequired[str]
+    departement:   NotRequired[str | None]
+    vecka:         NotRequired[str]
+    vecka_url:     NotRequired[str | None]
+    relevans:      NotRequired[float]
+    info:          NotRequired[str]
 
 
 # ── Textutdrag och trunkering ─────────────────────────────────────────────────
@@ -397,8 +567,8 @@ def _hamta_pdf_vid_behov(doc_id: int, doc_url: str, bilagor) -> Optional[str]:
 # Verktyg
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-def gov_list_typer() -> list[dict]:
+@mcp.tool(title="Lista dokumenttyper", annotations=LASNING_DB)
+def gov_list_typer() -> list[TypInfo]:
     """
     Listar tillgängliga dokumenttyper med antal dokument och indexeringsstatus.
 
@@ -439,7 +609,7 @@ def gov_list_typer() -> list[dict]:
     return result
 
 
-@mcp.tool()
+@mcp.tool(title="Sök i regeringsdokument", annotations=LASNING_EXTERN)
 def gov_search(
     query: str = "",
     typ: str = "",
@@ -448,7 +618,7 @@ def gov_search(
     avsandare_kod: str = "",
     sz: int = 20,
     sok_live: bool = False,
-) -> list[dict]:
+) -> list[Dokument]:
     """
     Söker i metadata för alla regeringsdokument (lagrådsremisser, remisser,
     förordningsmotiv, internationella överenskommelser, kommenterade dagordningar).
@@ -700,13 +870,13 @@ def gov_search(
     return result
 
 
-@mcp.tool()
+@mcp.tool(title="Hämta dokument", annotations=LASNING_EXTERN)
 def gov_get_document(
     url: str,
     hamta_fulltext: bool = True,
     max_tecken: int = GOV_MAX_TECKEN,
     fran_tecken: int = 0,
-) -> dict:
+) -> Dokument:
     """
     Hämtar ett enskilt dokument med fulltext via dess g0v.se-URL.
 
@@ -756,13 +926,11 @@ def gov_get_document(
         # Cache-miss: försök hämta live från g0v.se och upserta
         rad = _hamta_fran_g0v_live(url)
         if not rad:
-            return {
-                "fel": (
-                    f"Dokument med URL '{url}' hittades inte — "
-                    "varken i lokal cache eller via live-hämtning från g0v.se. "
-                    "Kontrollera att URL:en är korrekt (format: /remisser/YYYY/MM/...)."
-                )
-            }
+            raise ToolError(
+                f"Dokument med URL '{url}' hittades inte — "
+                "varken i lokal cache eller via live-hämtning från g0v.se. "
+                "Kontrollera att URL:en är korrekt (format: /remisser/YYYY/MM/...)."
+            )
 
     doc = _rad_till_dict_dokument(rad)
     doc_id = rad[0]
@@ -802,14 +970,14 @@ def gov_get_document(
     return doc
 
 
-@mcp.tool()
+@mcp.tool(title="Hämta textstycke på position", annotations=LASNING_DB)
 def gov_get_chunk(
     url: str,
     chunk_index: int,
     kontext: int = 0,
     max_tecken: int = 0,
     fran_tecken: int = 0,
-) -> dict:
+) -> ChunkSvar:
     """
     Hämtar ett textstycke ur ett dokument på position i stället för på relevans.
 
@@ -829,7 +997,7 @@ def gov_get_chunk(
     Kräver PostgreSQL med pgvector — chunks lagras bara där.
     """
     if not db._ar_postgres():
-        return {"fel": "Textstycken lagras bara i PostgreSQL. SQLite stöds inte."}
+        raise ToolError("Textstycken lagras bara i PostgreSQL. SQLite stöds inte.")
 
     kontext = min(max(0, kontext), 5)
 
@@ -859,28 +1027,24 @@ def gov_get_chunk(
             cur.close(); conn.close()
 
             if not meta:
-                return {"fel": f"Dokumentet '{url}' finns inte i databasen.", "url": url}
+                raise ToolError(f"Dokumentet '{url}' finns inte i databasen.")
             if not meta[1]:
-                return {
-                    "fel": (
-                        "Dokumentet finns men har inga indexerade textstycken. "
-                        "Anropa gov_get_document(url) först — den chunkar och "
-                        "indexerar dokumentet."
-                    ),
-                    "url": url, "titel": meta[0],
-                }
-            return {
-                "fel": (
-                    f"Dokumentet har inget textstycke med chunk_index {chunk_index}. "
-                    f"Det har {meta[1]} stycken (numrerade från 0)."
-                ),
-                "url": url, "titel": meta[0], "antal_stycken": meta[1],
-            }
+                raise ToolError(
+                    "Dokumentet finns men har inga indexerade textstycken. "
+                    "Anropa gov_get_document(url) först — den chunkar och "
+                    "indexerar dokumentet."
+                )
+            raise ToolError(
+                f"Dokumentet har inget textstycke med chunk_index {chunk_index}. "
+                f"Det har {meta[1]} stycken (numrerade från 0)."
+            )
 
         cur.close(); conn.close()
+    except ToolError:
+        raise
     except Exception as exc:
         log.error(f"gov_get_chunk misslyckades ({url}): {exc}")
-        return {"fel": str(exc), "url": url}
+        raise ToolError(f"Kunde inte hämta textstycket: {exc}") from exc
 
     text   = "\n\n".join(r[1] or "" for r in rader)
     utdrag = _skar_ut(text, max_tecken, fran_tecken)
@@ -896,8 +1060,8 @@ def gov_get_chunk(
     }
 
 
-@mcp.tool()
-def gov_search_in_document(url: str, query: str, top_k: int = 5) -> list[dict]:
+@mcp.tool(title="Sök semantiskt i ett dokument", annotations=LASNING_DB)
+def gov_search_in_document(url: str, query: str, top_k: int = 5) -> list[ChunkTraff]:
     """
     Semantisk sökning inom ett enskilt dokument (kräver PostgreSQL med pgvector).
 
@@ -912,7 +1076,7 @@ def gov_search_in_document(url: str, query: str, top_k: int = 5) -> list[dict]:
     Returnerar lista med chunk_text och relevanspoäng (cosinuslikhet).
     """
     if not db._ar_postgres():
-        return [{"fel": "Semantisk sökning kräver PostgreSQL med pgvector. SQLite stöds inte."}]
+        raise ToolError("Semantisk sökning kräver PostgreSQL med pgvector. SQLite stöds inte.")
 
     modell = _hamta_modell()
     fraga_vektor = modell.encode(query).tolist()
@@ -947,11 +1111,11 @@ def gov_search_in_document(url: str, query: str, top_k: int = 5) -> list[dict]:
     return result
 
 
-@mcp.tool()
+@mcp.tool(title="Indexera dokument i bulk", annotations=SYNK)
 def gov_indexera_bulk(
     batch_storlek: int = 10,
     fortsatt_fran_index: int = 0,
-) -> dict:
+) -> BulkIndexResultat:
     """
     Chunkar och embeddar redan nedladdade dokument i bulk.
 
@@ -966,7 +1130,7 @@ def gov_indexera_bulk(
     Returnerar: totalt_kvar, detta_batch, indexerade_chunks, nasta_index (null om klart).
     """
     if not db._ar_postgres():
-        return {"fel": "Bulk-indexering kräver PostgreSQL med pgvector."}
+        raise ToolError("Bulk-indexering kräver PostgreSQL med pgvector.")
 
     conn = db._hamta_db()
     cur  = conn.cursor()
@@ -1015,7 +1179,7 @@ def gov_indexera_bulk(
     }
 
 
-@mcp.tool()
+@mcp.tool(title="Sök i regeringsbeslut", annotations=LASNING_DB)
 def gov_search_beslut(
     query: str = "",
     from_date: str = "",
@@ -1024,7 +1188,7 @@ def gov_search_beslut(
     statsrad: str = "",
     page: int = 1,
     page_size: int = 20,
-) -> dict:
+) -> BeslutResultat:
     """
     Söker i regeringsbeslut sedan september 2024.
 
@@ -1136,8 +1300,8 @@ def gov_search_beslut(
     }
 
 
-@mcp.tool()
-def gov_get_beslut_by_diarienummer(diarienummer: str) -> list[dict]:
+@mcp.tool(title="Hämta beslut på diarienummer", annotations=LASNING_DB)
+def gov_get_beslut_by_diarienummer(diarienummer: str) -> list[BeslutPost]:
     """
     Hämtar alla regeringsbeslut kopplade till ett specifikt diarienummer.
 
@@ -1292,12 +1456,12 @@ def _chunka_och_indexera_dokument(dokument_id: int, fulltext: str, conn) -> int:
 # Verktyg — remissvar
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(title="Hämta remissvar", annotations=SYNK)
 def gov_hamta_remissvar(
     remiss_url: str,
     batch_storlek: int = 5,
     fortsatt_fran_index: int = 0,
-) -> dict:
+) -> RemissvarResultat:
     """
     Laddar ned och cachar remissvar för en remisspost i omgångar.
 
@@ -1348,10 +1512,10 @@ def gov_hamta_remissvar(
     rad = cur.fetchone()
     if not rad:
         cur.close(); conn.close()
-        return {"fel": f"Remisspost hittades inte: {remiss_url}"}
+        raise ToolError(f"Remisspost hittades inte: {remiss_url}")
     if rad[1] != "2099":
         cur.close(); conn.close()
-        return {"fel": f"URL pekar inte på en remisspost (typ_kod={rad[1]})."}
+        raise ToolError(f"URL pekar inte på en remisspost (typ_kod={rad[1]}).")
 
     remiss_id  = rad[0]
     bilagor_raw = rad[2]
@@ -1506,8 +1670,8 @@ def gov_hamta_remissvar(
     }
 
 
-@mcp.tool()
-def gov_list_remissinstanser(remiss_url: str) -> list[dict]:
+@mcp.tool(title="Lista remissinstanser", annotations=LASNING_DB)
+def gov_list_remissinstanser(remiss_url: str) -> list[RemissinstansStatus]:
     """
     Listar alla remissinstanser för en remisspost med cachestatus.
 
@@ -1537,7 +1701,7 @@ def gov_list_remissinstanser(remiss_url: str) -> list[dict]:
     rad = cur.fetchone()
     if not rad:
         cur.close(); conn.close()
-        return [{"fel": f"Remisspost hittades inte: {remiss_url}"}]
+        raise ToolError(f"Remisspost hittades inte: {remiss_url}")
 
     remiss_id   = rad[0]
     bilagor_raw = rad[1]
@@ -1568,13 +1732,13 @@ def gov_list_remissinstanser(remiss_url: str) -> list[dict]:
     return result
 
 
-@mcp.tool()
+@mcp.tool(title="Sök semantiskt i remissvar", annotations=LASNING_DB)
 def gov_search_remissvar(
     remiss_url: str,
     query: str,
     remissinstans: str = "",
     top_k: int = 5,
-) -> list[dict]:
+) -> list[RemissvarTraff]:
     """
     Semantisk sökning i remissvar för en specifik remiss (kräver PostgreSQL).
 
@@ -1602,7 +1766,7 @@ def gov_search_remissvar(
     Returnerar lista med: remissinstans, chunk_text, relevans.
     """
     if not db._ar_postgres():
-        return [{"fel": "Semantisk sökning kräver PostgreSQL med pgvector."}]
+        raise ToolError("Semantisk sökning kräver PostgreSQL med pgvector.")
 
     modell       = _hamta_modell()
     fraga_vektor = modell.encode(query).tolist()
@@ -1695,11 +1859,11 @@ def _konfigurera_logging():
 # Verktyg — ärendeförteckningar (beslut pre-sept 2024)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(title="Hämta ärendeförteckning", annotations=SYNK)
 def gov_hamta_arendeforteckning(
     vecka_url: str,
     departement: str = "",
-) -> dict:
+) -> ArendeforteckningResultat:
     """
     Hämtar, cachar och indexerar ärendeförtecknings-PDF:er för en given vecka (pre-sept 2024).
 
@@ -1715,9 +1879,9 @@ def gov_hamta_arendeforteckning(
     Returnerar: antal nya PDF:er indexerade, antal chunks, lista med departement.
     """
     if not ARENDEFORTECKNING_AKTIV:
-        return {"fel": "Ärendeförteckningar är inaktiverade (ARENDEFORTECKNING_AKTIV=false i .env)."}
+        raise ToolError("Ärendeförteckningar är inaktiverade (ARENDEFORTECKNING_AKTIV=false i .env).")
     if not db._ar_postgres():
-        return {"fel": "Ärendeförteckningar kräver PostgreSQL med pgvector."}
+        raise ToolError("Ärendeförteckningar kräver PostgreSQL med pgvector.")
 
     import requests
     from bs4 import BeautifulSoup
@@ -1725,12 +1889,17 @@ def gov_hamta_arendeforteckning(
     BASE_URL = "https://www.regeringen.se"
     full_url = BASE_URL + vecka_url if vecka_url.startswith("/") else vecka_url
 
+    # Parsa vecka och år ur URL — oberoende av om PDF-länkar hittas nedan.
+    vecka_match = re.search(r"vecka[_-](\d+)[_-](\d{4})", vecka_url)
+    vecka_nummer = int(vecka_match.group(1)) if vecka_match else None
+    vecka_ar     = int(vecka_match.group(2)) if vecka_match else None
+
     # Hämta veckosidan och extrahera PDF-länkar
     try:
         resp = requests.get(full_url, timeout=30)
         resp.raise_for_status()
     except Exception as e:
-        return {"fel": f"Kunde inte hämta veckosidan: {e}"}
+        raise ToolError(f"Kunde inte hämta veckosidan: {e}") from e
 
     soup = BeautifulSoup(resp.text, "lxml")
     pdf_lankar = []
@@ -1744,12 +1913,13 @@ def gov_hamta_arendeforteckning(
             pdf_lankar.append((namn, pdf_url))
 
     if not pdf_lankar:
-        return {"info": "Inga PDF-länkar hittades på sidan.", "url": full_url}
-
-    # Parsa vecka och år ur URL
-    vecka_match = re.search(r"vecka[_-](\d+)[_-](\d{4})", vecka_url)
-    vecka_nummer = int(vecka_match.group(1)) if vecka_match else None
-    vecka_ar     = int(vecka_match.group(2)) if vecka_match else None
+        return {
+            "nya_pdf":       0,
+            "totalt_chunks": 0,
+            "departement":   [],
+            "vecka_nummer":  vecka_nummer,
+            "vecka_ar":      vecka_ar,
+        }
 
     conn = db._hamta_db()
     cur  = conn.cursor()
@@ -1861,14 +2031,14 @@ def gov_hamta_arendeforteckning(
     }
 
 
-@mcp.tool()
+@mcp.tool(title="Sök semantiskt i ärendeförteckningar", annotations=LASNING_DB)
 def gov_search_arendeforteckning(
     query: str,
     from_date: str = "",
     to_date: str = "",
     departement: str = "",
     top_k: int = 5,
-) -> list[dict]:
+) -> list[ArendeforteckningTraff]:
     """
     Semantisk sökning i indexerade ärendeförteckningar (beslut pre-sept 2024).
 
@@ -1885,7 +2055,7 @@ def gov_search_arendeforteckning(
     Returnerar: lista med chunk_text, departement, vecka, relevans.
     """
     if not db._ar_postgres():
-        return [{"fel": "Sökning kräver PostgreSQL med pgvector."}]
+        raise ToolError("Sökning kräver PostgreSQL med pgvector.")
 
     modell = _hamta_modell()
     fraga_vektor = modell.encode(query).tolist()
@@ -1948,49 +2118,9 @@ def gov_search_arendeforteckning(
 
 if __name__ == "__main__":
     _log_path = _konfigurera_logging()
-    # Databasinitiering: fel loggas men kraschar inte servern. Detta gör att
-    # MCP-servern startar även om PostgreSQL-containern råkar vara nere vid
-    # Claude Desktops uppstart. Verktygsanrop kommer att fela tills DB är uppe,
-    # men servern överlever och behöver inte startas om manuellt.
-    try:
-        db.initiera_schema()
-    except Exception as exc:
-        log.warning("Databasinitiering misslyckades: %s — fortsätter utan DB", exc)
-
-    if MCP_TRANSPORT == "http":
-        # HTTP-läge med Bearer-token-autentisering.
-        # MCP_API_KEY är obligatoriskt i HTTP-läge — saknas den startar
-        # servern inte alls (fail-closed). Detta förhindrar att en
-        # felkonfigurerad server exponerar API:t utan autentisering.
-        if not MCP_API_KEY:
-            raise SystemExit(
-                "MCP_API_KEY är obligatoriskt när MCP_TRANSPORT=http. "
-                "Sätt nyckeln i .env och starta om."
-            )
-
-        import uvicorn
-        from starlette.applications import Starlette
-        from starlette.middleware.base import BaseHTTPMiddleware
-        from starlette.responses import Response
-
-        class BearerTokenMiddleware(BaseHTTPMiddleware):
-            async def dispatch(self, request, call_next):
-                auth = request.headers.get("Authorization", "")
-                if auth != f"Bearer {MCP_API_KEY}":
-                    return Response("Obehörig", status_code=401)
-                return await call_next(request)
-
-        # Preladdning av embeddingmodell i HTTP-läge
-        _hamta_modell()
-
-        app = Starlette()
-        app.add_middleware(BearerTokenMiddleware)
-        mcp_app = mcp.get_asgi_app()
-        app.mount("/", mcp_app)
-
-        log.info(f"Startar HTTP-server på {MCP_HOST}:{MCP_PORT}")
-        uvicorn.run(app, host=MCP_HOST, port=MCP_PORT)
-    else:
-        # stdio-läge (standard)
-        log.info("Startar i stdio-läge")
-        mcp.run()
+    # Uppstart och transportval sköts av mcp_transport.starta: den kör
+    # db.initiera_schema() i båda lägena (fel loggas men kraschar inte
+    # servern — den ska starta i MCP-klienten även om PostgreSQL-
+    # containern råkar vara nere), och laddar embeddingmodellen i förväg
+    # bara i http-läge, där första anropet annars skulle vänta på den.
+    starta(mcp, standardport=8009, initiera=db.initiera_schema, forvarm_http=_hamta_modell)

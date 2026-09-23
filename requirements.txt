@@ -4,9 +4,14 @@ pgvector>=0.2
 sqlalchemy>=2.0
 
 # PDF-extraktion
-ocrmypdf>=16.0
 pymupdf>=1.24
 pymupdf4llm>=0.0.17
+
+# OCR-fallback för bildbaserade PDF:er — valfritt. Importeras bara vid
+# behov (pdf_lib.ocr_pdf), så servern startar och de flesta dokument
+# behandlas utan den. Installeras separat om Tesseract finns tillgängligt:
+#   .venv/bin/python3 -m pip install "ocrmypdf>=16.0"
+# ocrmypdf>=16.0
 
 # Embeddings
 sentence-transformers>=3.0
@@ -16,7 +21,7 @@ torch>=2.0
 lingua-language-detector>=2.0
 
 # MCP-server
-mcp>=1.0
+mcp>=2.0,<3
 
 # HTTP-transport
 starlette>=0.36

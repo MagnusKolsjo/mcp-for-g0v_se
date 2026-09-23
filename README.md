@@ -28,8 +28,10 @@ Täcker lagrådsremisser, remissmissiv, förordningsmotiv, internationella
 ## Krav
 
 - Python 3.11+
+- `mcp>=2.0,<3`
 - PostgreSQL med pgvector-tillägget (rekommenderas) eller SQLite (begränsat — semantisk sökning inaktiveras)
-- Tesseract OCR för bildbaserade PDF:er: `brew install tesseract tesseract-lang`
+- Tesseract OCR och `ocrmypdf` för bildbaserade PDF:er — valfritt, se
+  installationsavsnittet: `brew install tesseract tesseract-lang`
 - Internetåtkomst mot regeringen.se och g0v.se
 
 ## Installation
@@ -39,6 +41,8 @@ git clone https://github.com/MagnusKolsjo/mcp-for-g0v_se.git
 cd mcp-for-g0v_se
 python3 -m venv .venv
 .venv/bin/python3 -m pip install -r requirements.txt
+# Valfritt: OCR-fallback för bildbaserade PDF:er (kräver Tesseract, se ovan)
+.venv/bin/python3 -m pip install "ocrmypdf>=16.0"
 cp config.example.env .env
 # Redigera .env med din databasanslutning
 ```
@@ -85,6 +89,23 @@ Lägg till i din MCP-klient (t.ex. Claude Desktop, `claude_desktop_config.json`)
   "cwd": "/sökväg/till/mcp-for-g0v_se"
 }
 ```
+
+## HTTP-läge
+
+stdio (standard) och http är symmetriska transportval — http passar delad
+drift bakom en reverse proxy där en serverprocess betjänar flera klienter.
+
+```env
+MCP_TRANSPORT=http
+MCP_HOST=127.0.0.1
+MCP_PORT=8009
+MCP_API_KEY=<en hemlig nyckel>
+```
+
+**`MCP_API_KEY` är obligatoriskt i http-läge.** Saknas den avbryter
+servern uppstarten (fail-closed) i stället för att exponera en oskyddad
+endpoint. Anropa med `Authorization: Bearer <nyckel>`. stdio-läget berörs
+inte av detta krav.
 
 ## Licens
 
