@@ -63,6 +63,11 @@ MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio")
 GOV_MAX_TECKEN = int(os.getenv("GOV_MAX_TECKEN", "60000"))
 REMISSVAR_TTL_DAYS = int(os.getenv("REMISSVAR_CACHE_TTL_DAYS", "365"))
 
+# Tak på gov_search totala svarsstorlek. sz begränsar antalet poster, men
+# en remiss eller lagrådsremiss med många bilagor kan ändå göra svaret
+# flera hundra KB. Taket kapar på hela poster, aldrig mitt i en post.
+SOK_TECKEN_TAK = int(os.getenv("SOK_TECKEN_TAK", "300000"))
+
 # Vanliga svenska småord som filtreras bort vid tokeniserad FTS-sökning.
 # Listan är empiriskt vald för svenska juridiska och parlamentariska sökfrågor —
 # tillräckligt bred för att plocka bort brus, tillräckligt smal för att inte
@@ -409,6 +414,53 @@ def _rad_till_dict_dokument(rad) -> dict:
         "har_remissvar": har_remissvar,
         "har_fulltext":  rad[9] is not None,
     }
+
+
+def _kapa_sokresultat(result: list[dict]) -> list[dict]:
+    """Kapar en gov_search-resultatlista vid ungefär SOK_TECKEN_TAK tecken.
+
+    sz begränsar bara antalet poster — en remiss eller lagrådsremiss med
+    många bilagor kan ändå göra svaret flera hundra KB (växer med antalet
+    bilagor, se bilagor-fältet). Kapningen sker på hela poster, aldrig
+    mitt i en post, och lämnar en tydlig markör i sista medtagna postens
+    `las_vidare`-fält. Resultatet är redan sorterat fallande på
+    publiceringsdatum, så resten nås genom att smalna av med `year_to`
+    satt till året för den sista medtagna posten.
+    """
+    if not result:
+        return result
+    if len(json.dumps(result, ensure_ascii=False, default=str)) <= SOK_TECKEN_TAK:
+        return result
+
+    kapad: list[dict] = []
+    storlek = 0
+    for post in result:
+        post_storlek = len(json.dumps(post, ensure_ascii=False, default=str))
+        if kapad and storlek + post_storlek > SOK_TECKEN_TAK:
+            break
+        kapad.append(post)
+        storlek += post_storlek
+    if not kapad:
+        kapad = [result[0]]  # Minst en post, även om den ensam överskrider taket.
+
+    if len(kapad) < len(result):
+        sista = dict(kapad[-1])
+        forslag = (
+            f"Svaret kapades vid {len(kapad)} av {len(result)} träffar för att hålla "
+            "svarsstorleken rimlig. Träffarna är sorterade fallande på publiceringsdatum."
+        )
+        try:
+            fortsatt_ar = int((sista.get("publicerad") or "")[:4])
+        except (TypeError, ValueError):
+            fortsatt_ar = None
+        if fortsatt_ar:
+            forslag += f" Fortsätt med year_to={fortsatt_ar} för äldre träffar."
+        else:
+            forslag += " Smalna av sökningen (typ, year_from/year_to, avsandare_kod) för fler."
+        sista["las_vidare"] = forslag
+        kapad[-1] = sista
+
+    return kapad
 
 
 # ---------------------------------------------------------------------------
@@ -775,7 +827,7 @@ def gov_search(
     conn.close()
 
     if result or not sok_live:
-        return result
+        return _kapa_sokresultat(result)
 
     # Inga träffar i lokal cache — försök hämta live från g0v.se.
     # Bestäm vilka listor som är relevanta (alla om typ inte angetts).
@@ -889,7 +941,7 @@ def gov_search(
         result = result[:sz]
     cur3.close()
     conn3.close()
-    return result
+    return _kapa_sokresultat(result)
 
 
 @mcp.tool(title="Hämta dokument", annotations=LASNING_EXTERN)

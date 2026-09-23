@@ -49,6 +49,14 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
   fångar ett oväntat undantag (databasen är nere, en fråga misslyckas),
   loggar den faktiska orsaken och kastar `ToolError` med den i
   meddelandet i stället för att låta undantaget bubbla obehandlat.
+- **`gov_search` kunde svara flera hundra KB** vid stora `sz` mot
+  dokument med många bilagor (t.ex. remisser med hundratals remissvar).
+  Svaret kapas nu vid ungefär `SOK_TECKEN_TAK` (standard 300 000 tecken,
+  hela poster, aldrig mitt i en post). Sista medtagna posten får ett
+  `las_vidare`-fält som säger hur många träffar som kapades och hur man
+  fortsätter (`year_to` satt till året för sista medtagna posten,
+  eftersom träffarna redan är sorterade fallande på publiceringsdatum).
+  `sz` och övriga parametrar betyder fortfarande exakt vad de gjorde.
 
 ### Brytande ändringar
 
