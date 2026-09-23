@@ -47,10 +47,17 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 
 ### Brytande ändringar
 
-- Ingen brytande ändring i verktygens namn, parametrar eller normala
-  svarsform. `{"fel": ...}`-svar har ersatts av `ToolError` (`isError`) —
-  en klient som läste `fel`-nyckeln i `structuredContent` måste läsa
+- Verktygens namn och parametrar är oförändrade, men svarsformen är det
+  inte överallt. `{"fel": ...}`-svar har ersatts av `ToolError` (`isError`)
+  — en klient som läste `fel`-nyckeln i `structuredContent` måste läsa
   felmeddelandet från protokollets felkanal i stället.
+- **`gov_hamta_arendeforteckning`** utan träffade PDF-länkar gav tidigare
+  `{"info": ..., "url": ...}`; ger nu ett normalt (tomt) resultat
+  (`nya_pdf=0`, `departement=[]` osv.), i samma form som ett lyckat anrop.
+- **`gov_search_in_document`, `gov_search_remissvar` och
+  `gov_search_arendeforteckning`** gav tidigare en enda listpost med ett
+  `info`-fält när inget var indexerat; returnerar nu en genuint tom lista.
+  Vad en tom lista betyder står i respektive verktygs docstring.
 - http-läget krävde redan `MCP_API_KEY` (fail-closed) före migreringen;
   det kravet är oförändrat, bara omflyttat till den delade
   `mcp_transport.py`.

@@ -67,7 +67,7 @@ REMISSVAR_TTL_DAYS = int(os.getenv("REMISSVAR_CACHE_TTL_DAYS", "365"))
 # tillräckligt bred för att plocka bort brus, tillräckligt smal för att inte
 # dölja substantiella söktermer som "för" i en myndighetsbenämning.
 # Framtida förbättring: ersätt ILIKE-tokenisering med PostgreSQL tsvector +
-# GIN-index (inbyggd svensk stoppordslista + stemming, se backlogg i 09-stream-dokumentet).
+# GIN-index (inbyggd svensk stoppordslista + stemming).
 _STOPPORD = {
     "och", "att", "är", "av", "för", "med", "som", "det",
     "den", "de", "en", "ett", "om", "på", "till", "från",
@@ -245,12 +245,11 @@ class ChunkSvar(TypedDict):
 
 
 class ChunkTraff(TypedDict):
-    """Semantisk träff i ett dokument (gov_search_in_document) — eller ett
-    hjälpmeddelande när inga chunks finns ännu."""
-    chunk_text:   NotRequired[str]
-    relevans:     NotRequired[float]
-    chunk_index:  NotRequired[int]
-    info:         NotRequired[str]
+    """Semantisk träff i ett dokument (gov_search_in_document). Tom lista
+    betyder att inga chunks finns ännu — se verktygets docstring."""
+    chunk_text:   str
+    relevans:     float
+    chunk_index:  int
 
 
 class BulkIndexResultat(TypedDict):
@@ -306,12 +305,11 @@ class RemissinstansStatus(TypedDict):
 
 
 class RemissvarTraff(TypedDict):
-    """Semantisk träff i remissvar (gov_search_remissvar) — eller ett
-    hjälpmeddelande när inga chunks finns ännu."""
-    remissinstans:  NotRequired[str]
-    chunk_text:     NotRequired[str]
-    relevans:       NotRequired[float]
-    info:           NotRequired[str]
+    """Semantisk träff i remissvar (gov_search_remissvar). Tom lista betyder
+    att inga chunks finns ännu — se verktygets docstring."""
+    remissinstans:  str
+    chunk_text:     str
+    relevans:       float
 
 
 class ArendeforteckningResultat(TypedDict):
@@ -324,14 +322,13 @@ class ArendeforteckningResultat(TypedDict):
 
 
 class ArendeforteckningTraff(TypedDict):
-    """Semantisk träff i ärendeförteckningar (gov_search_arendeforteckning) —
-    eller ett hjälpmeddelande när inga är indexerade."""
-    chunk_text:    NotRequired[str]
-    departement:   NotRequired[str | None]
-    vecka:         NotRequired[str]
-    vecka_url:     NotRequired[str | None]
-    relevans:      NotRequired[float]
-    info:          NotRequired[str]
+    """Semantisk träff i ärendeförteckningar (gov_search_arendeforteckning).
+    Tom lista betyder att inga är indexerade ännu — se verktygets docstring."""
+    chunk_text:    str
+    departement:   str | None
+    vecka:         str
+    vecka_url:     str | None
+    relevans:      float
 
 
 # ── Textutdrag och trunkering ─────────────────────────────────────────────────
@@ -766,7 +763,7 @@ def gov_search(
     else:
         listor_att_hamta = [(ep, tk) for _, ep, tk in _URL_PREFIX_TILL_LISTA]
 
-    # Samla träffar per typ_kod — alla listor genomsöks alltid (Bg3) för att
+    # Samla träffar per typ_kod — alla listor genomsöks alltid för att
     # sz-budgeten inte ska tillfalla den lista som råkar komma först.
     # Träffarna sorteras på publicerad och skärs till sz vid utskriften.
     live_resultat_per_typ: dict[str, list[dict]] = {}
@@ -1073,7 +1070,9 @@ def gov_search_in_document(url: str, query: str, top_k: int = 5) -> list[ChunkTr
         query:  Sökfråga på svenska.
         top_k:  Antal relevanta stycken att returnera (standard: 5).
 
-    Returnerar lista med chunk_text och relevanspoäng (cosinuslikhet).
+    Returnerar lista med chunk_text och relevanspoäng (cosinuslikhet). Tom
+    lista betyder att dokumentet ännu inte har indexerade textstycken —
+    anropa gov_get_document(url) först, den chunkar och indexerar det.
     """
     if not db._ar_postgres():
         raise ToolError("Semantisk sökning kräver PostgreSQL med pgvector. SQLite stöds inte.")
@@ -1104,9 +1103,6 @@ def gov_search_in_document(url: str, query: str, top_k: int = 5) -> list[ChunkTr
 
     cur.close()
     conn.close()
-
-    if not result:
-        return [{"info": "Inga chunks hittades. Anropa gov_get_document först för att indexera dokumentet."}]
 
     return result
 
@@ -1744,9 +1740,9 @@ def gov_search_remissvar(
 
     Söker i de indexerade remissvarens textstycken (chunks). Kräver att
     gov_hamta_remissvar körts och returnerat status OK för de instanser
-    du vill söka i — om inga chunks finns returneras ett hjälpmeddelande.
+    du vill söka i — annars returneras en tom lista.
 
-    Returnerar inga resultat om:
+    Returnerar en tom lista om:
       - gov_hamta_remissvar aldrig körts för remissen
       - PDF-nedladdningen misslyckades för en specifik instans
       - remissinstans-filtret är för strikt (testa utan remissinstans-param)
@@ -1805,9 +1801,6 @@ def gov_search_remissvar(
 
     cur.close()
     conn.close()
-
-    if not result:
-        return [{"info": "Inga chunks hittades. Anropa gov_hamta_remissvar först."}]
 
     return result
 
@@ -2042,8 +2035,9 @@ def gov_search_arendeforteckning(
     """
     Semantisk sökning i indexerade ärendeförteckningar (beslut pre-sept 2024).
 
-    Söker bland de PDF:er som hämtats via gov_hamta_arendeforteckning. Om inga
-    resultat hittas för en period kan PDF:erna för den perioden behöva hämtas först.
+    Söker bland de PDF:er som hämtats via gov_hamta_arendeforteckning. En tom
+    lista betyder att inga ärendeförteckningar är indexerade för sökningen —
+    PDF:erna för perioden kan behöva hämtas först.
 
     Args:
         query:       Sökfråga på svenska.
@@ -2109,9 +2103,6 @@ def gov_search_arendeforteckning(
 
     cur.close()
     conn.close()
-
-    if not result:
-        return [{"info": "Inga indexerade ärendeförteckningar matchade sökningen. Anropa gov_hamta_arendeforteckning för att hämta PDF:er för den aktuella perioden."}]
 
     return result
 
