@@ -58,6 +58,13 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 
 ### Rättat
 
+- **Serverns svar kunde hamna i loggfilen under en PDF-extraktion.**
+  `pdf_lib` pekade om processens stdout och stderr till `logs/subprocess.log`
+  medan en extraktion pågick, så att utskrifter från pymupdf4llm inte
+  skulle nå MCP-protokollet. Omdirigeringen gällde hela processen, så svar
+  som andra trådar skrev under tiden hamnade också i loggfilen. Den är nu
+  borttagen; extraktionsprocessen skickar i stället sina egna utskrifter
+  till `/dev/null`.
 - **OCR-språket var engelska.** `pymupdf4llm` OCR:ade sidor utan textlager
   med sitt standardspråk engelska, eftersom inget språk angavs. Skannade
   remissmissiv och internationella överenskommelser fick därför text som

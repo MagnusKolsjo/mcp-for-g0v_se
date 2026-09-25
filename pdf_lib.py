@@ -4,7 +4,6 @@ Importeras av 02_initial_bulk.py, 03_synka_data.py och mcp_server.py.
 """
 import os
 import json
-import threading
 import time
 import logging
 from datetime import datetime, timedelta, timezone
@@ -48,53 +47,6 @@ REGERINGEN_BAS  = "https://www.regeringen.se"
 # parallelltext på engelska, franska och tyska vid sidan av svenskan.
 OCR_PREFIX        = "GOV"
 OCR_STANDARDSPRAK = "swe+eng+fra+deu"
-
-
-import contextlib
-
-# FD 1 och FD 2 är processvida — två samtidiga extraktioner som redirigerar
-# dem samtidigt kan återställa i fel ordning (den ena trådens `finally`
-# lägger tillbaka den andra trådens sparade FD, eller tvärtom), vilket
-# permanent kan koppla bort JSON-RPC-stdout från MCP-klienten. Eftersom
-# resursen i sig är processvid finns ingen säker parallellism att vinna —
-# låset serialiserar helt enkelt de bullriga anropen.
-_TYST_FD_LOCK = threading.Lock()
-
-
-@contextlib.contextmanager
-def _tysta_subprocess_stdout():
-    """Redirigerar OS-nivåns stdout (FD 1) och stderr (FD 2) till loggfil
-    under extraktionen.
-
-    Extraktionen körs i en egen process (pdftext_skydd), men den processen
-    ärver FD 1 och FD 2 från servern. pymupdf4llm skriver statusrader
-    ("Using Tesseract for OCR processing" m.fl.) till stdout, och i
-    MCP-stdio-protokollet är FD 1 reserverad för JSON-RPC — en enda
-    okontrollerad rad krossar protokollet.
-
-    FD 1 och FD 2 pekas därför om till loggfilen innan extraktionsprocessen
-    startas, så att den ärver loggfilen, och återställs efteråt.
-    Python:s sys.stdout/sys.stderr berörs inte. Hela om- och
-    återställningen sker under _TYST_FD_LOCK, eftersom FD 1/2 delas av
-    alla trådar i processen.
-    """
-    log_path = _SCRIPT_DIR / "logs" / "subprocess.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with _TYST_FD_LOCK:
-        save_out = os.dup(1)
-        save_err = os.dup(2)
-        log_fd   = os.open(str(log_path), os.O_WRONLY | os.O_APPEND | os.O_CREAT)
-        try:
-            os.dup2(log_fd, 1)
-            os.dup2(log_fd, 2)
-            yield
-        finally:
-            os.dup2(save_out, 1)
-            os.dup2(save_err, 2)
-            os.close(save_out)
-            os.close(save_err)
-            os.close(log_fd)
 
 
 # Dokumenttyper som ska bulk-laddas ned
@@ -146,10 +98,11 @@ def extrahera(sokvag: Path | str, kalla_id: str = "", kalla_url: str = "") -> Op
     """
     kalla_id = kalla_id or Path(sokvag).name
     try:
-        with _tysta_subprocess_stdout():
-            return extrahera_pdf(sokvag, prefix=OCR_PREFIX,
-                                 standardsprak=OCR_STANDARDSPRAK,
-                                 kalla_id=kalla_id, kalla_url=kalla_url)
+        # Extraktionsprocessen skickar själv sina utskrifter till /dev/null,
+        # så serverns stdout (JSON-RPC i stdio-läget) berörs inte.
+        return extrahera_pdf(sokvag, prefix=OCR_PREFIX,
+                             standardsprak=OCR_STANDARDSPRAK,
+                             kalla_id=kalla_id, kalla_url=kalla_url)
     except Exception as e:
         log.warning(f"Textextraktion misslyckades ({Path(sokvag).name}): {e}")
         return None
