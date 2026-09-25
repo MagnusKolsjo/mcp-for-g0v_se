@@ -1576,7 +1576,7 @@ def gov_hamta_remissvar(
     Returnerar: totalt antal remissvar, behandlat intervall, nasta_index (null = klart),
     lista med {remissinstans, status, antal_tecken}.
     """
-    from pdf_lib import ladda_ned_pdf, extrahera_text, pdf_cache_sokvag
+    from pdf_lib import ladda_ned_pdf, extrahera_text, fullstandig_url, pdf_cache_sokvag
     import time as _time
 
     use_pg = db._ar_postgres()
@@ -1683,20 +1683,15 @@ def gov_hamta_remissvar(
             })
             continue
 
-        text = extrahera_text(sokvag)
-        if not text:
-            log.info(f"Ingen text — försöker OCR-fallback: {sokvag.name}")
-            from pdf_lib import ocr_pdf
-            ocr_sokvag = ocr_pdf(sokvag)
-            if ocr_sokvag:
-                text = extrahera_text(ocr_sokvag)
+        text = extrahera_text(sokvag, kalla_id=f"remissvar:{rv_id}",
+                              kalla_url=fullstandig_url(att_url))
 
         if not text:
             # Visa filstorlek så användaren kan se om det är en (möjligen korrupt) liten fil
             storlek_kb = sokvag.stat().st_size // 1024
             resultat.append({
                 "remissinstans": instans,
-                "status": f"FEL (ingen text efter OCR; pdf {storlek_kb} kB)",
+                "status": f"FEL (ingen text; pdf {storlek_kb} kB)",
             })
             continue
 
@@ -2108,7 +2103,8 @@ def gov_hamta_arendeforteckning(
         # Extrahera text
         try:
             import pdf_lib as _pdf_lib
-            fulltext = _pdf_lib.extrahera_text(pdf_sokvag)
+            fulltext = _pdf_lib.extrahera_text(pdf_sokvag, kalla_id=f"arendeforteckning:{vecka_ar}-{vecka_nummer}",
+                                               kalla_url=pdf_url)
         except Exception as e:
             log.warning(f"Textextrahering misslyckades ({pdf_sokvag}): {e}")
             fulltext = None

@@ -12,10 +12,10 @@ from pathlib import Path
 from typing import Optional
 
 import requests
-import pymupdf4llm
 from dotenv import load_dotenv
 
 import db
+from pdftext_skydd import PdfResultat, extrahera_pdf
 
 load_dotenv()
 
@@ -43,6 +43,12 @@ PDF_CACHE_DIR   = _absolut_cache_sokvag("PDF_CACHE_DIR", "pdf_cache")
 FORDROJNING     = float(os.getenv("PDF_DOWNLOAD_DELAY", "0.5"))
 REGERINGEN_BAS  = "https://www.regeringen.se"
 
+# Prefix för pdftext_skydd:s miljövariabler (GOV_OCR_SPRAK m.fl.) och
+# OCR-språk när GOV_OCR_SPRAK saknas. Internationella överenskommelser har
+# parallelltext på engelska, franska och tyska vid sidan av svenskan.
+OCR_PREFIX        = "GOV"
+OCR_STANDARDSPRAK = "swe+eng+fra+deu"
+
 
 import contextlib
 
@@ -58,20 +64,19 @@ _TYST_FD_LOCK = threading.Lock()
 @contextlib.contextmanager
 def _tysta_subprocess_stdout():
     """Redirigerar OS-nivåns stdout (FD 1) och stderr (FD 2) till loggfil
-    under bullriga anrop.
+    under extraktionen.
 
-    pymupdf4llm anropar internt Tesseract/OCR-bibliotek via C-bindningar
-    som skriver direkt till FD 1 — utan att gå via Python:s sys.stdout.
-    I MCP-stdio-protokollet är FD 1 reserverad för JSON-RPC, så varje
-    okontrollerad utskrift från subprocesses krossar protokollet och
-    triggar popup-varningar i Claude Desktop.
+    Extraktionen körs i en egen process (pdftext_skydd), men den processen
+    ärver FD 1 och FD 2 från servern. pymupdf4llm skriver statusrader
+    ("Using Tesseract for OCR processing" m.fl.) till stdout, och i
+    MCP-stdio-protokollet är FD 1 reserverad för JSON-RPC — en enda
+    okontrollerad rad krossar protokollet.
 
-    Lösningen är en OS-nivå dup2-redirigering: FD 1 och FD 2 pekas om
-    till loggfilen under det bullriga anropet, och återställs efteråt.
-    Python:s sys.stdout/sys.stderr berörs inte (för MCP-protokollet
-    behåller dem så att JSON-RPC-svar fortsätter fungera utanför
-    contextmanagern). Hela om- och återställningen sker under
-    _TYST_FD_LOCK, eftersom FD 1/2 delas av alla trådar i processen.
+    FD 1 och FD 2 pekas därför om till loggfilen innan extraktionsprocessen
+    startas, så att den ärver loggfilen, och återställs efteråt.
+    Python:s sys.stdout/sys.stderr berörs inte. Hela om- och
+    återställningen sker under _TYST_FD_LOCK, eftersom FD 1/2 delas av
+    alla trådar i processen.
     """
     log_path = _SCRIPT_DIR / "logs" / "subprocess.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -113,7 +118,7 @@ def pdf_cache_sokvag(bilage_url: str) -> Path:
 
 def ladda_ned_pdf(url: str, sokvag: Path) -> tuple[bool, str]:
     """Laddar ned en PDF till disk. Returnerar (True, "") vid lyckat resultat, annars (False, felmeddelande)."""
-    full_url = REGERINGEN_BAS + url if url.startswith("/") else url
+    full_url = fullstandig_url(url)
     try:
         svar = SESSION.get(full_url, timeout=30, stream=True)
         svar.raise_for_status()
@@ -127,26 +132,40 @@ def ladda_ned_pdf(url: str, sokvag: Path) -> tuple[bool, str]:
         return False, str(e)
 
 
-def extrahera_text(sokvag: Path) -> Optional[str]:
-    """
-    Extraherar text från en PDF med pymupdf4llm.
-    Returnerar Markdown-text eller None vid fel.
+def extrahera(sokvag: Path | str, kalla_id: str = "", kalla_url: str = "") -> Optional[PdfResultat]:
+    """Extraherar en PDF till markdown med pdftext_skydd.
 
-    OBS: Flerspråkiga PDF:er (t.ex. internationella överenskommelser med
-    parallelltext) returnerar blandad text. Språkfiltrering läggs till
-    i kommande version.
+    Extraktionen körs i en egen process under minnes- och tidsvakt, med
+    OCR-språket GOV_OCR_SPRAK (standard swe+eng+fra+deu). Sidor utan
+    textlager och block som fick läsas med ren textutvinning noteras i
+    OCR-kön. Returnerar None om PDF:en inte gick att öppna.
 
-    pymupdf4llm:s C-backends skriver diagnostikmeddelanden direkt till
-    FD 1 — vi tystar dem under anropet för att inte korrumpera
-    MCP-stdio-protokollet.
+    Flerspråkiga PDF:er (t.ex. internationella överenskommelser med
+    parallelltext) returnerar blandad text; språkfiltreringen sker vid
+    chunkningen.
     """
+    kalla_id = kalla_id or Path(sokvag).name
     try:
         with _tysta_subprocess_stdout():
-            text = pymupdf4llm.to_markdown(str(sokvag))
-        return text if text and len(text.strip()) > 50 else None
+            return extrahera_pdf(sokvag, prefix=OCR_PREFIX,
+                                 standardsprak=OCR_STANDARDSPRAK,
+                                 kalla_id=kalla_id, kalla_url=kalla_url)
     except Exception as e:
-        log.warning(f"Textextraktion misslyckades ({sokvag.name}): {e}")
+        log.warning(f"Textextraktion misslyckades ({Path(sokvag).name}): {e}")
         return None
+
+
+def extrahera_text(sokvag: Path | str, kalla_id: str = "", kalla_url: str = "") -> Optional[str]:
+    """Som extrahera(), men returnerar bara texten, eller None om den är
+    tom eller kortare än 50 tecken."""
+    res = extrahera(sokvag, kalla_id, kalla_url)
+    text = res.text if res else None
+    return text if text and len(text.strip()) > 50 else None
+
+
+def fullstandig_url(url: str) -> str:
+    """Bilage-URL:er i g0v-listorna är relativa regeringen.se."""
+    return REGERINGEN_BAS + url if url.startswith("/") else url
 
 
 def uppdatera_dokument_med_fulltext(doc_id: int, fulltext: str, sokvag: Path, conn):
@@ -166,39 +185,6 @@ def uppdatera_dokument_med_fulltext(doc_id: int, fulltext: str, sokvag: Path, co
 
 
 
-def ocr_pdf(sokvag: Path) -> Optional[Path]:
-    """
-    Kör OCR på en bildbaserad PDF med ocrmypdf och Tesseract.
-    Skapar en ny PDF med inbäddat texlager bredvid originalet (_ocr-suffix).
-    Returnerar sökvägen till den OCR-behandlade filen, eller None vid fel.
-
-    Kräver att Tesseract och svenska språkpaket är installerade:
-      Linux:  apt install tesseract-ocr tesseract-ocr-swe
-      macOS:  brew install tesseract tesseract-lang
-    """
-    try:
-        import ocrmypdf
-    except ImportError:
-        log.warning("ocrmypdf är inte installerat — hoppar över OCR-fallback")
-        return None
-
-    ocr_sokvag = sokvag.with_name(sokvag.stem + "_ocr" + sokvag.suffix)
-    try:
-        # Tesseract som C-binär skriver progress till FD 1 även med
-        # quiet=True — använd FD-redirigering för MCP-säkerhet.
-        with _tysta_subprocess_stdout():
-            ocrmypdf.ocr(
-                str(sokvag),
-                str(ocr_sokvag),
-                language="swe+eng+fra+deu",
-                progress_bar=False,
-                quiet=True,
-            )
-        log.info(f"OCR klar: {ocr_sokvag.name}")
-        return ocr_sokvag
-    except Exception as e:
-        log.warning(f"OCR misslyckades ({sokvag.name}): {e}")
-        return None
 
 def behandla_ett_dokument(doc: dict, conn) -> str:
     """Laddar ned och extraherar text för ett enskilt dokument. Returnerar statussträng."""
@@ -226,25 +212,18 @@ def behandla_ett_dokument(doc: dict, conn) -> str:
             return f"FEL (nedladdning — {fel}): {doc.get('titel','')[:60]}"
         time.sleep(FORDROJNING)
 
-    ocr_sokvag = None
-    text = extrahera_text(sokvag)
+    text = extrahera_text(sokvag, kalla_id=f"dokument:{doc['id']}",
+                          kalla_url=fullstandig_url(bilage_url))
     if not text:
-        log.info(f"Ingen text — försöker OCR-fallback: {sokvag.name}")
-        ocr_sokvag = ocr_pdf(sokvag)
-        if ocr_sokvag:
-            text = extrahera_text(ocr_sokvag)
-    if not text:
-        return f"FEL (extraktion misslyckades även efter OCR): {doc.get('titel','')[:60]}"
+        return f"FEL (extraktion misslyckades): {doc.get('titel','')[:60]}"
 
     uppdatera_dokument_med_fulltext(doc["id"], text, sokvag, conn)
 
     # Radera PDF-filen direkt — fulltexten finns nu i databasen
-    for fil in [sokvag, ocr_sokvag]:
-        if fil and fil.exists():
-            try:
-                fil.unlink()
-            except Exception as e:
-                log.warning(f"Kunde inte radera PDF-fil {fil.name}: {e}")
+    try:
+        sokvag.unlink(missing_ok=True)
+    except Exception as e:
+        log.warning(f"Kunde inte radera PDF-fil {sokvag.name}: {e}")
 
     return f"OK ({len(text)} tecken): {doc.get('titel','')[:60]}"
 
