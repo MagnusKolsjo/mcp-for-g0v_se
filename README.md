@@ -94,6 +94,37 @@ servern och synken:
   sparas i `ocr_ko/filer/`. De kan senare köras genom en bättre OCR utan
   att laddas ned igen. Mappen styrs av `GOV_OCR_KO_MAPP`.
 
+### Göra om OCR med fel språk
+
+Äldre extraktioner OCR:ade skannade PDF:er med engelska, så att till
+exempel "Länsstyrelsen i Södermanlands län" blev "Lansstyrelsen i
+S6dermanlands lan". `07_gor_om_ocr.py` hittar sådana dokument i
+`dokument`-tabellen och kör om extraktionen:
+
+```bash
+# Lista urvalet (titel, år, typ, bilage-URL och PDF-storlek) utan att ändra något
+.venv/bin/python3 07_gor_om_ocr.py --torrkorning
+
+# Kör om ett enskilt dokument, eller de tio första i urvalet
+.venv/bin/python3 07_gor_om_ocr.py --id 5638
+.venv/bin/python3 07_gor_om_ocr.py --max 10
+
+# Kör hela urvalet
+.venv/bin/python3 07_gor_om_ocr.py
+```
+
+Urvalet är dokument med mer än 3 000 tecken fulltext där under 0,2 % av
+bokstäverna är å, ä eller ö men ordet "och" förekommer mer än två gånger
+per 1 000 tecken, alltså svensk text utan svenska tecken. Remissvar ingår
+inte. Skriptet laddar ned PDF:en (`bilagor[0]`) och ersätter fulltexten
+bara om den nya texten har fler å/ä/ö och inte är väsentligt kortare
+(minst 80 % av den gamla längden). Chunks och embeddings byggs då om för
+dokumentet. Varje behandlat dokument markeras i `synkstatus`
+(`ocr_omkord:<id>`), så en avbruten körning fortsätter där den slutade;
+dokument som gav fel markeras inte och försöks igen nästa gång. `--id`
+kör alltid om, även ett markerat dokument. Sammanfattningen på slutet
+räknar förbättrade, oförändrade och fel.
+
 ## MCP-konfiguration
 
 Lägg till i din MCP-klient (t.ex. Claude Desktop, `claude_desktop_config.json`):

@@ -49,6 +49,12 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 - **OCR-kö.** Dokument med sidor utan textlager, eller med block som fick
   läsas med ren textutvinning, noteras i `ocr_ko/ko.jsonl` och PDF:en
   sparas i `ocr_ko/filer/`, så att de kan köras genom en bättre OCR senare.
+- **`07_gor_om_ocr.py`**, ett engångsskript som gör om extraktionen för
+  dokument som OCR:ats med engelska: svensk text (många " och ") nästan
+  helt utan å, ä och ö. Fulltexten ersätts bara när den nya har fler
+  å/ä/ö och inte är väsentligt kortare, och chunks och embeddings byggs då
+  om. Körningen går att återuppta; behandlade dokument markeras i
+  `synkstatus` (`ocr_omkord:<id>`). `--torrkorning` listar urvalet.
 
 ### Rättat
 
