@@ -57,6 +57,8 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
   `synkstatus` (`ocr_omkord:<id>`). `--torrkorning` listar urvalet.
 
 ### Rättat
+- Schemainitieringen rullades tillbaka vid varje start: den sista delen av schemafilen består bara av kommentarer, och psycopg2 vägrar köra en tom sats ("can't execute an empty query"). Delar utan SQL hoppas nu över.
+- `CRON_SCHEMA` i `config.example.env` står inom citattecken, så att filen kan läsas in i skalet.
 
 - **Serverns svar kunde hamna i loggfilen under en PDF-extraktion.**
   `pdf_lib` pekade om processens stdout och stderr till `logs/subprocess.log`

@@ -89,6 +89,12 @@ def initiera_schema():
             # dela upp pa satsgrans och kor sats for sats.
             satser = [s.strip() for s in sql.split(";") if s.strip()]
             for sats in satser:
+                # En del som bara består av kommentarer (t.ex. rubriken för
+                # migrationsblocket sist i filen) är en tom sats för psycopg2,
+                # och felet skulle rulla tillbaka hela initieringen.
+                if not any(rad.strip() and not rad.strip().startswith("--")
+                           for rad in sats.splitlines()):
+                    continue
                 cur.execute(sats)
         else:
             # sqlite3 accepterar executescript for flera satser i ett block.
