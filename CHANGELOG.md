@@ -38,12 +38,25 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
   anrop kunde tidigare trigga parallell inläsning av samma modell.
 - `requirements.txt`: `mcp>=2.0,<3`.
 
+### Tillagt
+
+- **Minnesvakt för PDF-extraktionen** (`pdftext_skydd.py`). Extraktionen
+  körs i en egen process, i block om `GOV_PDF_SIDBLOCK` sidor, och avbryts
+  om processen passerar `GOV_PDF_MAX_MINNE_MB` eller `GOV_PDF_TIDSGRANS_S`.
+  Blocket läses då med ren textutvinning. Tidigare analyserades hela
+  dokumentet i ett svep, och ett bildtungt dokument kunde kräva tiotals GB
+  minne.
+- **OCR-kö.** Dokument med sidor utan textlager, eller med block som fick
+  läsas med ren textutvinning, noteras i `ocr_ko/ko.jsonl` och PDF:en
+  sparas i `ocr_ko/filer/`, så att de kan köras genom en bättre OCR senare.
+
 ### Rättat
 
-- **`ocrmypdf` är nu dokumenterat som valfritt** i `requirements.txt` och
-  README, i linje med att `pdf_lib.ocr_pdf` redan importerade det lat.
-  Servern startar och behandlar de allra flesta dokument utan paketet;
-  det behövs bara för bildbaserade PDF:er utan textlager.
+- **OCR-språket var engelska.** `pymupdf4llm` OCR:ade sidor utan textlager
+  med sitt standardspråk engelska, eftersom inget språk angavs. Skannade
+  remissmissiv och internationella överenskommelser fick därför text som
+  "Lansstyrelsen i S6dermanlands lan". Språket anges nu uttryckligen,
+  `swe+eng+fra+deu` som standard, och kan ändras med `GOV_OCR_SPRAK`.
 - **Databasfel gav tidigare bara "Error executing tool X" utan orsak.**
   Alla tretton verktyg är nu dekorerade med `_fel_som_toolerror`, som
   fångar ett oväntat undantag (databasen är nere, en fråga misslyckas),
@@ -73,6 +86,12 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
   värdkontrollerad omdirigeringsföljning (max 5 steg — ingen automatisk
   följning till en annan värd). Båda hämtningarna använder nu projektets
   egen User-Agent, som tidigare saknades helt för dessa två anrop.
+
+### Borttaget
+
+- **`ocrmypdf`-reserven** (`pdf_lib.ocr_pdf`). Den krävde ett paket som
+  aldrig var installerat och har därför aldrig kunnat köras. Sidor utan
+  textlager OCR:as i stället direkt vid extraktionen.
 
 ### Brytande ändringar
 

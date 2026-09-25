@@ -30,8 +30,8 @@ Täcker lagrådsremisser, remissmissiv, förordningsmotiv, internationella
 - Python 3.11+
 - `mcp>=2.0,<3`
 - PostgreSQL med pgvector-tillägget (rekommenderas) eller SQLite (begränsat — semantisk sökning inaktiveras)
-- Tesseract OCR och `ocrmypdf` för bildbaserade PDF:er — valfritt, se
-  installationsavsnittet: `brew install tesseract tesseract-lang`
+- Tesseract OCR med språkpaketen `swe`, `eng`, `fra` och `deu` för PDF:er
+  utan textlager: `brew install tesseract tesseract-lang` (macOS)
 - Internetåtkomst mot regeringen.se och g0v.se
 
 ## Installation
@@ -41,8 +41,6 @@ git clone https://github.com/MagnusKolsjo/mcp-for-g0v_se.git
 cd mcp-for-g0v_se
 python3 -m venv .venv
 .venv/bin/python3 -m pip install -r requirements.txt
-# Valfritt: OCR-fallback för bildbaserade PDF:er (kräver Tesseract, se ovan)
-.venv/bin/python3 -m pip install "ocrmypdf>=16.0"
 cp config.example.env .env
 # Redigera .env med din databasanslutning
 ```
@@ -77,6 +75,24 @@ MCP_TRANSPORT=stdio
 # Installera automatisk schemaläggning via cron eller launchd
 .venv/bin/python3 03_synka_data.py --installera-schema
 ```
+
+## PDF-extraktion och OCR
+
+PDF:erna görs om till markdown med `pdftext_skydd.py`. Tre saker skyddar
+servern och synken:
+
+- **OCR-språk.** Sidor utan textlager OCR:as med Tesseract på språken i
+  `GOV_OCR_SPRAK` (standard `swe+eng+fra+deu`). Utan uttryckligt språk
+  används engelska, och å, ä och ö blir fel.
+- **Minnesvakt.** Extraktionen körs i en egen process i block om
+  `GOV_PDF_SIDBLOCK` sidor. Passerar processen `GOV_PDF_MAX_MINNE_MB` eller
+  `GOV_PDF_TIDSGRANS_S` avbryts den, och blocket läses med ren
+  textutvinning i stället. Ett enskilt bildtungt dokument kan då inte
+  fälla datorn.
+- **OCR-kön.** Dokument med sidor utan textlager, eller med block som
+  lästes med ren textutvinning, noteras i `ocr_ko/ko.jsonl`, och PDF:en
+  sparas i `ocr_ko/filer/`. De kan senare köras genom en bättre OCR utan
+  att laddas ned igen. Mappen styrs av `GOV_OCR_KO_MAPP`.
 
 ## MCP-konfiguration
 
