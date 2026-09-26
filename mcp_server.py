@@ -167,7 +167,7 @@ def _ar_svensk(text: str) -> bool:
 
 mcp = MCPServer(
     "gov-dokument",
-    version="3.2.0",
+    version="4.0.0",
     cache_hints=CACHE_HINTAR,
     instructions=(
         "MCP-server för dokument från Regeringskansliet via g0v.se och regeringen.se: "
@@ -476,7 +476,7 @@ def _kapa_sokresultat(result: list[dict]) -> list[dict]:
 _G0V_BAS = "https://g0v.se"
 _G0V_SESSION = _requests.Session()
 _G0V_SESSION.headers.update({
-    "User-Agent": "mcp-for-g0v_se/1.0 (+https://github.com/MagnusKolsjo/mcp-for-g0v_se)"
+    "User-Agent": "mcp-for-g0v_se/4.0 (+https://github.com/MagnusKolsjo/mcp-for-g0v_se)"
 })
 
 # In-memory-cache för g0v.se-listor — minskar nätverksanrop vid upprepade

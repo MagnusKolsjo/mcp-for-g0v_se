@@ -6,8 +6,11 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [4.0.0] — 2026-09-26
+
 ### Ändrat
 
+- User-Agent-strängen följer huvudversionen: `mcp-for-g0v_se/4.0`.
 - **Migrerad till `mcp>=2.0,<3`.** Servern byggs nu på `MCPServer` från
   `mcp.server.mcpserver` i stället för `FastMCP`. Transportvalet (stdio/http)
   sköts av en egen kopia av `mcp_transport.py`, som ersätter den tidigare

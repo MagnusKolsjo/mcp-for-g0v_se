@@ -56,7 +56,7 @@ LISTOR = [
 ]
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "mcp-for-g0v_se/1.0 (+https://github.com/MagnusKolsjo/mcp-for-g0v_se)"})
+SESSION.headers.update({"User-Agent": "mcp-for-g0v_se/4.0 (+https://github.com/MagnusKolsjo/mcp-for-g0v_se)"})
 
 
 def hamta_senast_uppdaterad() -> str:

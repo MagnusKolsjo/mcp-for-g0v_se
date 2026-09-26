@@ -55,7 +55,7 @@ BULK_NAMN  = {"1326": "förordningsmotiv", "2099": "remissmissiv", "1332": "int.
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "mcp-for-g0v_se/1.0 (+https://github.com/MagnusKolsjo/mcp-for-g0v_se)",
+    "User-Agent": "mcp-for-g0v_se/4.0 (+https://github.com/MagnusKolsjo/mcp-for-g0v_se)",
     "Referer": REGERINGEN_BAS,
 })
 
