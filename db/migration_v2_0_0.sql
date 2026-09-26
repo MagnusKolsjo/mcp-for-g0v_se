@@ -7,7 +7,7 @@
 -- Idempotent: hjälpfunktionerna kontrollerar mot information_schema och
 -- hoppar tysta över rename som redan är applicerade. Säker att köra om.
 --
--- Förutsättning: Claude Desktop ska vara stängt så att MCP-servern inte
+-- Förutsättning: MCP-klienten ska vara stängd så att MCP-servern inte
 -- läser/skriver mot tabellerna under transaktionen.
 --
 -- Backup ska tas FÖRE körning:

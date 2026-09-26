@@ -10,6 +10,7 @@ Versionshanteringen följer [Semantic Versioning](https://semver.org/).
 
 ### Ändrat
 
+- Texterna är produktneutrala: README, konfigurationsexempel, kommentarer och äldre CHANGELOG-poster nämner MCP-klienten i stället för en viss klient.
 - User-Agent-strängen följer huvudversionen: `mcp-for-g0v_se/4.0`.
 - **Migrerad till `mcp>=2.0,<3`.** Servern byggs nu på `MCPServer` från
   `mcp.server.mcpserver` i stället för `FastMCP`. Transportvalet (stdio/http)
@@ -321,10 +322,10 @@ kan kräva nytt servernamn i klientkonfigurationen för att synas.
   anropades utan try/except i `__main__`-blocket. När Postgres-containern råkade vara
   nere (t.ex. efter omstart av datorn innan Docker startat) dog hela processen direkt
   med `psycopg2.OperationalError: connection to server at "127.0.0.1", port 5432
-  failed: Connection refused`, och Claude Desktop loggade "Server transport closed
+  failed: Connection refused`, och MCP-klienten loggade "Server transport closed
   unexpectedly". Åtgärd: try/except runt anropet — fel loggas som varning men
   servern startar ändå. Verktygsanrop felar tills DB är uppe, men användaren slipper
-  starta om Claude Desktop när containern startas i efterhand.
+  starta om MCP-klienten när containern startas i efterhand.
 
 ## [2.3.0] — 2026-05-15
 
@@ -380,7 +381,7 @@ kan kräva nytt servernamn i klientkonfigurationen för att synas.
 - Totalt 12 MCP-verktyg.
 
 ### Tekniskt
-- Servernamnet i Claude Desktop-config bytt till `gov-dokument-v2` för att
+- Servernamnet i MCP-klientens konfiguration bytt till `gov-dokument-v2` för att
   kringgå namnbaserad verktygscache i MCP-klienter.
 
 ## [2.1.0] — 2026-05-11
@@ -458,7 +459,7 @@ tecken till ASCII-svenska enligt projektkonvention. Bland annat:
 - `sökväg` → `sokvag` (alla varianter, även halv-renamad `sokväg`)
 - `värde` → `varde`
 - `FÖRDRÖJNING` → `FORDROJNING`
-- `avsändare_kod` → `avsandare_kod` (sannolik orsak till "verktyg saknas"-buggen i Claude Desktop)
+- `avsändare_kod` → `avsandare_kod` (sannolik orsak till "verktyg saknas"-buggen i MCP-klienten)
 - `_hämta_modell` → `_hamta_modell`
 - `_hämta_pdf_on_demand` → `_hamta_pdf_vid_behov` (också engelska→svenska)
 - `hämta_latest_updated` → `hamta_senast_uppdaterad` (också engelska→svenska)

@@ -1894,8 +1894,8 @@ def gov_search_remissvar(
 def _konfigurera_logging():
     """Konfigurerar logging beroende på transportläge.
 
-    I stdio-läge skrivs MCP-protokollet till stdout och Claude Desktop
-    läser stderr. Varje rad på stderr visas som en popup-varning — vid
+    I stdio-läge skrivs MCP-protokollet till stdout och MCP-klienten
+    läser stderr. Hos vissa klienter visas varje rad på stderr som en popup-varning — vid
     300+ remissvar blir det ohanterligt. Lösningen: dirigera all loggning
     till `logs/mcp_server.log` i stdio-läge så att stderr förblir tomt.
     I HTTP-läge är stderr legitim console-output (t.ex. för uvicorn).
@@ -1912,7 +1912,7 @@ def _konfigurera_logging():
         return None
     else:
         # stdio-läge: skriv till fil för att undvika popup-kaskaden i
-        # Claude Desktop. Filen roteras inte automatiskt — skall hållas
+        # MCP-klienten. Filen roteras inte automatiskt — skall hållas
         # i schack via separat logrotate eller manuell rensning.
         log_path = _SCRIPT_DIR / "logs" / "mcp_server.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)

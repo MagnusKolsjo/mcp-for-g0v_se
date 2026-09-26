@@ -127,7 +127,7 @@ räknar förbättrade, oförändrade och fel.
 
 ## MCP-konfiguration
 
-Lägg till i din MCP-klient (t.ex. Claude Desktop, `claude_desktop_config.json`):
+Lägg till i din MCP-klients konfiguration (`mcpServers`):
 
 ```json
 "gov-dokument": {

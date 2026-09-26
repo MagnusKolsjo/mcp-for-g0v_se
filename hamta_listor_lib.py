@@ -33,7 +33,7 @@ def _absolut_cache_sokvag(env_var: str, default_undermapp: str) -> Path:
     """Returnerar absolut sokvag till en cache-katalog.
 
     Relativa sökvägar (från env eller default) tolkas alltid relativt
-    skriptets mapp — inte processens cwd. När Claude Desktop startar
+    skriptets mapp — inte processens cwd. När MCP-klienten startar
     MCP-servern utan korrekt cwd blir annars `./json_cache` lika med
     `/json_cache` på ett read-only filsystem.
     """
